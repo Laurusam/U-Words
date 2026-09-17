@@ -7,6 +7,19 @@ export type HistoryRetention = "forever" | "1" | "7" | "30";
 export type AppTheme = "dark" | "light";
 export type RecognitionQuality = "fast" | "ensemble";
 
+// Qwen3-ASR-Flash's documented language parameter values (not translation targets).
+export const ASR_LANGUAGES = [
+  ["auto", "自动（多语言混说）"], ["zh", "中文（普通话、四川话、闽南语、吴语）"],
+  ["yue", "粤语"], ["en", "英语"], ["ja", "日语"], ["de", "德语"],
+  ["ko", "韩语"], ["ru", "俄语"], ["fr", "法语"], ["pt", "葡萄牙语"],
+  ["ar", "阿拉伯语"], ["it", "意大利语"], ["es", "西班牙语"], ["hi", "印地语"],
+  ["id", "印尼语"], ["th", "泰语"], ["tr", "土耳其语"], ["uk", "乌克兰语"],
+  ["vi", "越南语"], ["cs", "捷克语"], ["da", "丹麦语"], ["fil", "菲律宾语"],
+  ["fi", "芬兰语"], ["is", "冰岛语"], ["ms", "马来语"], ["no", "挪威语"],
+  ["pl", "波兰语"], ["sv", "瑞典语"],
+] as const;
+export type AsrLanguage = typeof ASR_LANGUAGES[number][0];
+
 export const OVERLAY_STATE_EVENT = "u-words-overlay-state";
 export const OVERLAY_COMMAND_EVENT = "u-words-overlay-command";
 
@@ -17,9 +30,18 @@ export type OverlayState = {
   message: string;
   text: string;
   theme: AppTheme;
+  preview?: boolean;
+  copyFeedback?: string;
 };
 
-export type OverlayCommand = "cancel" | "finish" | "dismiss";
+export type OverlayCommand = "cancel" | "finish" | "dismiss" | "copy";
+
+export type InputTarget = { editable: boolean; appPid: number | null; reason: string; targetKey?: string };
+export type PlanReview = {
+  organizedPlan: string;
+  issues: { title: string; evidence: string; detail: string }[];
+  suggestions: { title: string; detail: string; condition: string }[];
+};
 
 export type AppProfile = {
   appName: string;
@@ -27,10 +49,17 @@ export type AppProfile = {
 };
 
 export type AppConfig = {
+  recordingMode: "toggle" | "hold";
+  linkPreviousDictation: boolean;
   theme: AppTheme;
+  asrProvider: "local" | "qwen";
+  asrRegion: "beijing" | "singapore";
+  asrFallbackLocal: boolean;
+  asrEnableItn: boolean;
+  llmUseAsrToken: boolean;
   recognitionQuality: RecognitionQuality;
   hotkey: string;
-  language: "auto" | "zh" | "en";
+  language: AsrLanguage;
   mode: DictationMode;
   translationTarget: "中文" | "English";
   llmProvider: string;
@@ -45,8 +74,6 @@ export type AppConfig = {
   fallbackToLiteral: boolean;
   selectedMicId: string;
   noiseSuppression: boolean;
-  vadEnabled: boolean;
-  autoStopSeconds: number;
   launchAtLogin: boolean;
   activeModel: string;
   historyRetention: HistoryRetention;
@@ -120,6 +147,7 @@ export type HistoryItem = {
   candidates?: Pick<TranscriptCandidate, "model" | "text" | "meanTokenProbability">[];
   warnings?: string[];
   renderedText: string;
+  generatedText?: string;
   mode: DictationMode;
   language: string;
   operation?: OperationMode;

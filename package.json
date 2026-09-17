@@ -1,10 +1,11 @@
 {
   "name": "u-words",
-  "version": "0.5.0",
+  "version": "0.6.7",
   "private": true,
   "description": "A lightweight local voice-to-text desktop app.",
   "type": "module",
   "scripts": {
+    "test": "node --test scripts/test-config-queue.mjs scripts/test-overlay.mjs scripts/test-macos-bundle.mjs scripts/test-audio.mjs scripts/test-plan-review.mjs scripts/test-languages.mjs scripts/test-text-output.mjs scripts/test-recording-flow.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview",

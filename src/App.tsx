@@ -1,10 +1,21 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { AudioCapture, listAudioInputs } from "./lib/audio";
 import { native } from "./lib/native";
+import { finalizeDictationText } from "./lib/textOutput";
+import { RecordingTrigger, replaceShortcuts } from "./lib/recordingTrigger";
+import { previousContext } from "./lib/continuity";
+import type { ContinuityEntry } from "./lib/continuity";
+import { ProcessingProgress } from "./components/ProcessingProgress";
+import { OverlayView } from "./components/OverlayView";
+import { OverlayPreview } from "./components/OverlayPreview";
+import { AsrLanguageSelect } from "./components/AsrLanguageSelect";
+import { PlanReviewView } from "./components/PlanReviewView";
+import type { PlanReviewSession } from "./components/PlanReviewView";
 import appIcon from "../src-tauri/icons/icon.png";
 import { OVERLAY_COMMAND_EVENT, OVERLAY_STATE_EVENT } from "./types";
 import type {
@@ -27,7 +38,14 @@ import type {
 } from "./types";
 
 const DEFAULT_CONFIG: AppConfig = {
+  recordingMode: "toggle",
+  linkPreviousDictation: false,
   theme: "dark",
+  asrProvider: "local",
+  asrRegion: "beijing",
+  asrFallbackLocal: true,
+  asrEnableItn: false,
+  llmUseAsrToken: false,
   recognitionQuality: "fast",
   hotkey: "CommandOrControl+Shift+Space",
   editHotkey: "CommandOrControl+Shift+E",
@@ -45,8 +63,6 @@ const DEFAULT_CONFIG: AppConfig = {
   fallbackToLiteral: true,
   selectedMicId: "",
   noiseSuppression: true,
-  vadEnabled: true,
-  autoStopSeconds: 2,
   launchAtLogin: false,
   activeModel: "small-q5_1",
   historyRetention: "30",
@@ -107,6 +123,8 @@ function migrateConfig(config: AppConfig): AppConfig {
   return {
     ...DEFAULT_CONFIG,
     ...config,
+    recordingMode: config.recordingMode === "hold" ? "hold" : "toggle",
+    linkPreviousDictation: config.linkPreviousDictation === true,
     dictionary: Array.isArray(config.dictionary) ? config.dictionary : [],
     appProfiles: Array.isArray(config.appProfiles) ? config.appProfiles : [],
   };
@@ -244,12 +262,32 @@ function MainApp() {
   const [level, setLevel] = useState(0);
   const [rawText, setRawText] = useState("");
   const [renderedText, setRenderedText] = useState("");
+  const [resultPreview, setResultPreview] = useState(false);
+  const resultPreviewRef = useRef(false);
+  const updateResultPreview = (value: boolean) => { resultPreviewRef.current = value; setResultPreview(value); };
+  const [planSession, setPlanSession] = useState<PlanReviewSession | null>(null);
+  const planGenerationRef = useRef(0);
+  const planBusyRef = useRef(false);
+  const inputTargetRef = useRef<{ editable: boolean; appPid: number | null; reason: string; targetKey?: string } | null>(null);
+  const previousDictationRef = useRef<ContinuityEntry | null>(null);
+  const pendingPreviousRef = useRef<string | undefined>(undefined);
+  const recordingTriggerRef = useRef(new RecordingTrigger());
+  const configRef = useRef(config);
+  configRef.current = config;
+  const shortcutQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const shortcutMapRef = useRef<Record<string, OperationMode>>({});
+  const startDictateRef = useRef<(hold?: boolean) => void>(() => undefined);
+  const selectionBusyRef = useRef(false);
   const [history, setHistory] = useState<HistoryItem[]>(readHistory);
   const [usageStats, setUsageStats] = useState<UsageStats>(readUsageStats);
   const [model, setModel] = useState<ModelStatus>(EMPTY_MODEL);
   const [modelBusy, setModelBusy] = useState<string | null>(null);
   const [apiKeySet, setApiKeySet] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
+  const [asrTokenSet, setAsrTokenSet] = useState(false);
+  const [asrTokenInput, setAsrTokenInput] = useState("");
+  const [asrTokenBusy, setAsrTokenBusy] = useState(false);
+  const [shareAsrToken, setShareAsrToken] = useState(false);
   const [newWord, setNewWord] = useState("");
   const [editingWord, setEditingWord] = useState<string | null>(null);
   const [editingWordValue, setEditingWordValue] = useState("");
@@ -286,13 +324,13 @@ function MainApp() {
   const usageStatsRef = useRef(usageStats);
   const recordingClockRef = useRef<{ recordingStartedAt: number; recordingStartedPerf: number } | null>(null);
   const toggleRecordingRef = useRef<() => void>(() => undefined);
-  const startEditRef = useRef<() => void>(() => undefined);
+  const startEditRef = useRef<(hold?: boolean) => void>(() => undefined);
   const finishRecordingRef = useRef<() => void>(() => undefined);
   const cancelCurrentRef = useRef<() => void>(() => undefined);
 
-  const showFloatingOverlay = () => {
+  const showFloatingOverlay = (expanded = false) => {
     if (!isTauriRuntime) return;
-    void native.showOverlay().catch((error) => setStatusMessage("悬浮窗显示失败：" + String(error)));
+    void native.showOverlay(expanded).catch((error) => setStatusMessage("悬浮窗显示失败：" + String(error)));
   };
 
   const hideFloatingOverlay = () => {
@@ -331,7 +369,7 @@ function MainApp() {
       await register(ESCAPE_HOTKEY, (event) => {
         if (event.state === "Pressed") cancelCurrentRef.current();
       });
-      if (escapeRegistrationRef.current !== requestId || (!recordingRef.current && !pipelineBusyRef.current)) {
+      if (escapeRegistrationRef.current !== requestId || (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current)) {
         await unregister(ESCAPE_HOTKEY).catch(() => undefined);
         return;
       }
@@ -393,30 +431,50 @@ function MainApp() {
   };
 
   const registerShortcuts = async (nextConfig: AppConfig) => {
-    try {
-      const oldShortcuts = [hotkeyRef.current, editHotkeyRef.current].filter(Boolean);
-      for (const shortcut of new Set(oldShortcuts)) await unregister(shortcut).catch(() => undefined);
-      const nextShortcuts = [nextConfig.hotkey, nextConfig.editHotkey].filter((shortcut, index, list) => Boolean(shortcut) && list.indexOf(shortcut) === index);
-      if (nextConfig.hotkey) {
-        await register(nextConfig.hotkey, (event) => {
-          if (event.state === "Pressed") toggleRecordingRef.current();
-        });
-      }
-      if (nextConfig.editHotkey && nextConfig.editHotkey !== nextConfig.hotkey) {
-        await register(nextConfig.editHotkey, (event) => {
-          if (event.state === "Pressed") startEditRef.current();
-        });
-      }
-      hotkeyRef.current = nextShortcuts[0] || "";
-      editHotkeyRef.current = nextConfig.editHotkey;
-      setHotkeyError("");
-    } catch (error) {
-      setHotkeyError("快捷键注册失败：" + String(error));
-    }
+    if (nextConfig.hotkey && nextConfig.hotkey.toLowerCase() === nextConfig.editHotkey.toLowerCase()) throw new Error("口述与编辑快捷键不能相同");
+    const oldKeys = Object.keys(shortcutMapRef.current);
+    const nextMap: Record<string, OperationMode> = {};
+    if (nextConfig.hotkey) nextMap[nextConfig.hotkey] = "dictate";
+    if (nextConfig.editHotkey) nextMap[nextConfig.editHotkey] = "edit";
+    await replaceShortcuts(oldKeys, Object.keys(nextMap), async (key) => {
+      await register(key, (event) => {
+        const operation = shortcutMapRef.current[key];
+        if (!operation) return;
+        const mode = configRef.current.recordingMode;
+        const action = recordingTriggerRef.current.handle(operation, event.state, mode, recordingRef.current, pipelineBusyRef.current || selectionBusyRef.current);
+        if (action === "finish") finishRecordingRef.current();
+        if (action === "start") {
+          if (operation === "edit") startEditRef.current(mode === "hold");
+          else startDictateRef.current(mode === "hold");
+        }
+      });
+    }, unregister);
+    shortcutMapRef.current = nextMap;
+    hotkeyRef.current = nextConfig.hotkey;
+    editHotkeyRef.current = nextConfig.editHotkey;
+    recordingTriggerRef.current.cancel();
+    setHotkeyError("");
   };
 
   const saveConfig = (patch: Partial<AppConfig>) => {
-    const next = { ...config, ...patch };
+    if ((patch.recordingMode !== undefined || patch.hotkey !== undefined || patch.editHotkey !== undefined) && (recordingRef.current || pipelineBusyRef.current || selectionBusyRef.current)) {
+      setHotkeyError("请结束当前任务后再修改录音方式或快捷键"); return;
+    }
+    if (patch.hotkey !== undefined || patch.editHotkey !== undefined) {
+      const pending = shortcutQueueRef.current.then(async () => {
+        if (recordingRef.current || pipelineBusyRef.current || selectionBusyRef.current) throw new Error("请结束当前任务后再修改快捷键");
+        const next = { ...configRef.current, ...patch };
+        await registerShortcuts(next);
+        configRef.current = next;
+        setConfig(next);
+        await native.saveConfig(next);
+      });
+      shortcutQueueRef.current = pending.catch((error) => setHotkeyError("快捷键设置未完成：" + String(error)));
+      return;
+    }
+    const next = { ...configRef.current, ...patch };
+    configRef.current = next;
+    if (patch.linkPreviousDictation === false) { previousDictationRef.current = null; pendingPreviousRef.current = undefined; }
     setConfig(next);
     void native.saveConfig(next).catch((error) => setStatusMessage("配置保存失败：" + String(error)));
     if (patch.launchAtLogin !== undefined) {
@@ -427,7 +485,6 @@ function MainApp() {
         void native.saveConfig(fallback);
       });
     }
-    if (patch.hotkey !== undefined || patch.editHotkey !== undefined) void registerShortcuts(next);
     if (patch.historyRetention !== undefined) storeHistory(historyRef.current, next.historyRetention);
   };
 
@@ -440,26 +497,38 @@ function MainApp() {
     return profile?.preset || config.defaultPreset;
   };
 
-  const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "") => {
-    if (recordingRef.current || pipelineBusyRef.current) return;
+  const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "", fromHold = false) => {
+    if (recordingRef.current || pipelineBusyRef.current || (selectionBusyRef.current && nextOperation === "dictate")) return;
+    if (planSession) { setStatusMessage("请先关闭方案检查，再开始录音"); return; }
+    if (config.asrProvider === "qwen" && !asrTokenSet) {
+      setStatus("error");
+      setStatusMessage("请先在设置中保存百炼 API Token，或切换本地 Whisper");
+      setView("settings");
+      return;
+    }
     pipelineBusyRef.current = true;
     cancelRequestedRef.current = false;
+    void registerEscapeShortcut();
     try {
       const appName = await native.getActiveApp().catch(() => "");
+      inputTargetRef.current = await native.getInputTarget().catch(() => ({ editable: false, appPid: null, reason: "无法确认输入光标，请复制文字" }));
+      pendingPreviousRef.current = nextOperation === "dictate" && config.mode === "smart" && inputTargetRef.current.editable
+        ? previousContext(previousDictationRef.current, inputTargetRef.current.targetKey, "", Date.now(), config.linkPreviousDictation) : undefined;
+      if (!pendingPreviousRef.current) previousDictationRef.current = null;
       const capture = new AudioCapture(
         setLevel,
         {
           deviceId: config.selectedMicId,
           noiseSuppression: config.noiseSuppression,
-          vadEnabled: config.vadEnabled,
-          autoStopSeconds: config.autoStopSeconds,
-        },
-        () => {
-          if (recordingRef.current) void finishRecordingRef.current();
         },
       );
-      await capture.start();
       captureRef.current = capture;
+      await capture.start();
+      if (cancelRequestedRef.current || (fromHold && !recordingTriggerRef.current.isHolding(nextOperation))) {
+        await capture.cancel(); captureRef.current = null; pipelineBusyRef.current = false;
+        void unregisterEscapeShortcut();
+        setStatus("idle"); setStatusMessage("按键已松开或任务已取消，本次未开始口述"); return;
+      }
       recordingClockRef.current = { recordingStartedAt: Date.now(), recordingStartedPerf: performance.now() };
       recordingRef.current = true;
       operationRef.current = nextOperation;
@@ -470,21 +539,31 @@ function MainApp() {
       setActiveApp(appName);
       setRawText("");
       setRenderedText("");
+      updateResultPreview(false);
       setStatus("recording");
-      setStatusMessage(nextOperation === "edit" ? "正在聆听编辑指令，再按一次快捷键完成" : "正在聆听，再按一次快捷键完成");
+      setStatusMessage((nextOperation === "edit" ? "正在聆听编辑指令，" : "正在聆听，") + (fromHold ? "松开快捷键完成" : "再按一次快捷键完成"));
       showFloatingOverlay();
       void registerEscapeShortcut();
     } catch (error) {
+      await captureRef.current?.cancel().catch(() => undefined);
+      captureRef.current = null;
       recordingClockRef.current = null;
       pipelineBusyRef.current = false;
       setStatus("error");
-      setStatusMessage("麦克风不可用：" + String(error));
+      void unregisterEscapeShortcut();
+      const detail = String(error);
+      setStatusMessage(/NotAllowedError|PermissionDeniedError/.test(detail)
+        ? "麦克风访问未获允许。请在系统隐私设置中允许 U-Words 使用麦克风，再重试；若仍失败，请检查输入设备和系统限制。"
+        : /NotFoundError|OverconstrainedError/.test(detail)
+          ? "当前麦克风不可用，请在设置中切换到系统默认麦克风。"
+          : "麦克风不可用：" + detail);
       showFloatingOverlay();
     }
   };
 
-  const startEditSelection = async () => {
-    if (recordingRef.current || pipelineBusyRef.current) return;
+  const startEditSelection = async (fromHold = false) => {
+    if (recordingRef.current || pipelineBusyRef.current || selectionBusyRef.current) return;
+    selectionBusyRef.current = true;
     try {
       if (!(await refreshAccessibilityStatus())) {
         setStatus("error");
@@ -499,18 +578,19 @@ function MainApp() {
         setStatusMessage("没有读取到选中文字：请先在目标应用中选中文本，再按编辑快捷键");
         return;
       }
-      await startRecording("edit", selected);
+      if (fromHold && !recordingTriggerRef.current.isHolding("edit")) return;
+      await startRecording("edit", selected, fromHold);
     } catch (error) {
       setStatus("error");
       setStatusMessage("读取选区失败：" + String(error));
-    }
+    } finally { selectionBusyRef.current = false; }
   };
 
   const renderWithRetry = async (request: Parameters<typeof native.render>[0]) => {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        return await native.render(request);
+        return await native.render({ ...request, previousText: configRef.current.linkPreviousDictation ? request.previousText : undefined });
       } catch (error) {
         lastError = error;
         if (attempt === 0 && isTransientRenderError(error)) {
@@ -547,7 +627,7 @@ function MainApp() {
         return;
       }
       setStatus("transcribing");
-      setStatusMessage("本地 Whisper 正在识别…");
+      setStatusMessage(config.asrProvider === "qwen" ? "千问云端正在识别…" : "本地 Whisper 正在识别…");
       const transcribeStartedAt = Date.now();
       const transcribeStartedPerf = performance.now();
       const transcription = await native.transcribe({
@@ -577,6 +657,9 @@ function MainApp() {
       const renderStartedAt = Date.now();
       const renderStartedPerf = performance.now();
       const preset = resolvePreset(currentApp);
+      const currentTarget = pendingPreviousRef.current ? await native.getInputTarget().catch(() => null) : null;
+      const context = currentOperation === "dictate" && config.mode === "smart" && currentTarget?.targetKey === inputTargetRef.current?.targetKey
+        ? previousContext(previousDictationRef.current, currentTarget?.targetKey, transcript, Date.now(), configRef.current.linkPreviousDictation) : undefined;
       const request = {
         text: transcript,
         mode: currentOperation === "edit" ? "smart" : config.mode,
@@ -591,6 +674,7 @@ function MainApp() {
         preset,
         appName: currentApp,
         selectedText: currentOperation === "edit" ? currentSelectedText : undefined,
+        previousText: context,
         candidates: transcription.candidates,
       } as const;
       let result;
@@ -603,6 +687,7 @@ function MainApp() {
           throw error;
         }
       }
+      result = { ...result, text: finalizeDictationText(result.text) };
       const renderedAt = Date.now();
       const renderMs = Math.round(performance.now() - renderStartedPerf);
       if (cancelRequestedRef.current) {
@@ -612,6 +697,7 @@ function MainApp() {
       setRenderedText(result.text);
       let warning = [result.warning, ...transcription.warnings].filter(Boolean).join("；") || undefined;
       let insertedAt: number | undefined;
+      let needsPreview = !config.autoInsert;
       if (config.autoInsert && result.text.trim()) {
         if (cancelRequestedRef.current) {
           hideFloatingOverlay();
@@ -619,16 +705,28 @@ function MainApp() {
         }
         if (!(await refreshAccessibilityStatus())) {
           warning = "文字已生成，但未插入：请在设置页授权 macOS 辅助功能";
+          needsPreview = true;
+        } else if (!inputTargetRef.current?.editable) {
+          warning = inputTargetRef.current?.reason || "未检测到输入光标，请复制文字";
+          needsPreview = true;
         } else {
           try {
-            await native.pasteText(result.text);
+            await native.pasteText(result.text, inputTargetRef.current.appPid);
             insertedAt = Date.now();
           } catch (error) {
             warning = "文本已生成，但自动插入失败：" + String(error);
+            needsPreview = true;
           }
         }
       }
       const completedAt = Date.now();
+      previousDictationRef.current = currentOperation === "dictate" && config.mode === "smart" && insertedAt && inputTargetRef.current?.targetKey && configRef.current.linkPreviousDictation
+        ? { text: result.text, targetKey: inputTargetRef.current.targetKey, at: completedAt } : null;
+      const previousEntry = previousDictationRef.current;
+      if (previousEntry) window.setTimeout(() => {
+        if (previousDictationRef.current === previousEntry) { previousDictationRef.current = null; pendingPreviousRef.current = undefined; }
+      }, 30_000);
+      pendingPreviousRef.current = undefined;
       const timing: HistoryTiming = {
         recordingStartedAt: recordingClock?.recordingStartedAt,
         recordingStoppedAt,
@@ -653,6 +751,7 @@ function MainApp() {
           candidates: transcription.candidates.map(({ model, text, meanTokenProbability }) => ({ model, text, meanTokenProbability })),
           warnings: [result.warning, ...transcription.warnings].filter((value): value is string => Boolean(value)),
           renderedText: result.text,
+          generatedText: result.text,
           mode: currentOperation === "edit" ? "smart" : config.mode,
           language: config.language,
           operation: currentOperation,
@@ -667,8 +766,11 @@ function MainApp() {
         recordUsage(rawStats, renderedStats, result.usedLlm, completedAt, false);
       });
       setStatus("ready");
-      setStatusMessage(warning || `${currentOperation === "edit" ? "选区已替换" : "已完成"} · 识别 ${formatDuration(asrMs)} · 整理 ${formatDuration(renderMs)}`);
+      updateResultPreview(needsPreview);
+      if (needsPreview) showFloatingOverlay(true);
+      setStatusMessage(warning || (needsPreview ? "自动插入已关闭，请复制文字" : `已发送粘贴 · 识别 ${formatDuration(asrMs)} · 整理 ${formatDuration(renderMs)}`));
     } catch (error) {
+      previousDictationRef.current = null;
       if (!cancelRequestedRef.current) {
         setStatus("error");
         setStatusMessage(String(error));
@@ -678,13 +780,22 @@ function MainApp() {
       pipelineBusyRef.current = false;
       recordingClockRef.current = null;
       setLevel(0);
-      void unregisterEscapeShortcut();
+      if (!resultPreviewRef.current) void unregisterEscapeShortcut();
     }
   };
 
   finishRecordingRef.current = () => void finishRecording();
 
   const cancelCurrent = async () => {
+    recordingTriggerRef.current.cancel();
+    previousDictationRef.current = null;
+    pendingPreviousRef.current = undefined;
+    if (!recordingRef.current && !pipelineBusyRef.current && resultPreviewRef.current) {
+      updateResultPreview(false);
+      hideFloatingOverlay();
+      void unregisterEscapeShortcut();
+      return;
+    }
     if (recordingRef.current && captureRef.current) {
       recordingRef.current = false;
       const capture = captureRef.current;
@@ -715,7 +826,8 @@ function MainApp() {
   };
 
   toggleRecordingRef.current = toggleRecording;
-  startEditRef.current = () => void startEditSelection();
+  startDictateRef.current = (hold = false) => void startRecording("dictate", "", hold);
+  startEditRef.current = (hold = false) => void startEditSelection(hold);
   cancelCurrentRef.current = () => void cancelCurrent();
 
   useEffect(() => {
@@ -724,7 +836,7 @@ function MainApp() {
     void listen<OverlayCommand>(OVERLAY_COMMAND_EVENT, ({ payload }) => {
       if (payload === "cancel") void cancelCurrentRef.current();
       if (payload === "finish") void finishRecordingRef.current();
-      if (payload === "dismiss") hideFloatingOverlay();
+      if (payload === "dismiss") { updateResultPreview(false); hideFloatingOverlay(); void unregisterEscapeShortcut(); }
     })
       .then((dispose) => {
         unlisten = dispose;
@@ -736,7 +848,7 @@ function MainApp() {
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape" || event.repeat) return;
-      if (!recordingRef.current && !pipelineBusyRef.current) return;
+      if (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current) return;
       event.preventDefault();
       void cancelCurrentRef.current();
     };
@@ -753,9 +865,10 @@ function MainApp() {
       message: statusMessage,
       text: renderedText || rawText,
       theme: config.theme,
+      preview: resultPreview,
     };
     void emitTo("overlay", OVERLAY_STATE_EVENT, overlayState).catch(() => undefined);
-  }, [config.theme, isTauriRuntime, level, operation, rawText, renderedText, status, statusMessage]);
+  }, [config.theme, isTauriRuntime, level, operation, rawText, renderedText, resultPreview, status, statusMessage]);
 
   useEffect(() => {
     let active = true;
@@ -765,13 +878,14 @@ function MainApp() {
         const nextConfig = migrateConfig(loadedConfig);
         setConfig(nextConfig);
         setApiKeySet(keySet);
+        setShareAsrToken(nextConfig.llmUseAsrToken || !keySet);
         setModel(loadedModel);
         setAccessibilityTrusted(trusted);
         const nextHistory = pruneHistory(historyRef.current, nextConfig.historyRetention);
         historyRef.current = nextHistory;
         setHistory(nextHistory);
         localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
-        void registerShortcuts(nextConfig);
+        void registerShortcuts(nextConfig).catch((error) => setHotkeyError("快捷键注册失败：" + String(error)));
         void listAudioInputs().then(setMicrophones).catch(() => undefined);
       })
       .catch((error) => setStatusMessage(String(error)));
@@ -786,6 +900,50 @@ function MainApp() {
       if (isTauriRuntime) void native.hideOverlay().catch(() => undefined);
     };
   }, [isTauriRuntime]);
+
+  useEffect(() => {
+    let active = true;
+    setAsrTokenSet(false);
+    setAsrTokenInput("");
+    if (isTauriRuntime) void native.getAsrTokenStatus(config.asrRegion)
+      .then((value) => { if (active) setAsrTokenSet(value); })
+      .catch((error) => { if (active) setStatusMessage(String(error)); });
+    return () => { active = false; };
+  }, [config.asrRegion, isTauriRuntime]);
+
+  const saveAsrToken = async () => {
+    const token = asrTokenInput.trim();
+    if (!token || asrTokenBusy) return;
+    setAsrTokenBusy(true);
+    try {
+      await native.saveAsrToken(config.asrRegion, token);
+      const nextConfig = { ...config, asrProvider: "qwen" as const, llmUseAsrToken: shareAsrToken };
+      await native.saveConfig(nextConfig);
+      setConfig(nextConfig);
+      setAsrTokenSet(true);
+      setAsrTokenInput("");
+      setStatus("idle");
+      setStatusMessage(shareAsrToken ? "Token 已安全保存，千问识别与文字整理已启用" : "Token 已安全保存，千问识别已启用；文字整理沿用原配置");
+    } catch (error) {
+      setStatus("error");
+      setStatusMessage(String(error));
+    } finally { setAsrTokenBusy(false); }
+  };
+
+  const clearAsrToken = async () => {
+    if (asrTokenBusy) return;
+    setAsrTokenBusy(true);
+    try {
+      await native.saveAsrToken(config.asrRegion, "");
+      setAsrTokenSet(false);
+      setAsrTokenInput("");
+      const nextConfig = { ...config, asrProvider: "local" as const, llmUseAsrToken: false };
+      await native.saveConfig(nextConfig);
+      setConfig(nextConfig);
+      setStatusMessage("当前地域 Token 已清除，已切回本地 Whisper；原文字整理配置保留");
+    } catch (error) { setStatusMessage(String(error)); }
+    finally { setAsrTokenBusy(false); }
+  };
 
   const saveApiKey = async () => {
     try {
@@ -919,7 +1077,8 @@ function MainApp() {
   const copyText = async (text: string) => {
     if (!text) return;
     try {
-      await navigator.clipboard.writeText(text);
+      if (isTauriRuntime) await native.copyText(text);
+      else await navigator.clipboard.writeText(text);
       setStatusMessage("已复制到剪贴板");
     } catch (error) {
       setStatusMessage("复制失败：" + String(error));
@@ -928,7 +1087,7 @@ function MainApp() {
 
   const testMicrophone = async () => {
     try {
-      const capture = new AudioCapture(setLevel, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression, vadEnabled: false });
+      const capture = new AudioCapture(setLevel, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression });
       await capture.start();
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       await capture.stop();
@@ -948,6 +1107,7 @@ function MainApp() {
     storeHistory(historyRef.current.map((item) => item.id === id ? {
       ...item,
       renderedText: rendered,
+      generatedText: item.generatedText ?? item.renderedText,
       stats: {
         raw: item.stats?.raw || getTextStats(item.rawText),
         rendered: getTextStats(rendered),
@@ -987,6 +1147,8 @@ function MainApp() {
   };
 
   const dismissResult = () => {
+    updateResultPreview(false);
+    void unregisterEscapeShortcut();
     setStatus("idle");
     setStatusMessage("准备就绪");
     hideFloatingOverlay();
@@ -999,8 +1161,56 @@ function MainApp() {
     return matchQuery && matchFilter;
   });
 
+  const openPlanReview = (text: string) => {
+    if (!text.trim()) return;
+    if (recordingRef.current || pipelineBusyRef.current) { setStatusMessage("请等待当前录音或整理完成，再检查方案"); return; }
+    planGenerationRef.current += 1;
+    planBusyRef.current = false;
+    setPlanSession({ source: text, provider: config.llmUseAsrToken ? "千问百炼 qwen-plus" : config.llmProvider, busy: false });
+  };
+  const closePlanReview = () => { planGenerationRef.current += 1; planBusyRef.current = false; setPlanSession(null); };
+  const checkPlan = async () => {
+    if (!planSession || planBusyRef.current) return;
+    const generation = planGenerationRef.current;
+    const source = planSession.source;
+    planBusyRef.current = true;
+    setPlanSession((value) => value && { ...value, busy: true, error: undefined });
+    try {
+      const result = await native.reviewPlan(source);
+      if (generation === planGenerationRef.current) setPlanSession((value) => value && { ...value, busy: false, result });
+    } catch (error) {
+      if (generation === planGenerationRef.current) setPlanSession((value) => value && { ...value, busy: false, error: String(error) });
+    } finally { if (generation === planGenerationRef.current) planBusyRef.current = false; }
+  };
+  const preparePlanInsertion = (text: string) => {
+    closePlanReview();
+    setRenderedText(finalizeDictationText(text));
+    setStatus("ready");
+    updateResultPreview(true);
+    setStatusMessage("方案整理正文已准备好，请复制到目标位置；原历史未修改");
+    showFloatingOverlay(true);
+    void registerEscapeShortcut();
+  };
+
+  useEffect(() => {
+    if (!planSession) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); closePlanReview(); }
+      if (event.key === "Tab") {
+        const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(".plan-review-dialog button:not(:disabled)"));
+        if (!buttons.length) return;
+        const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        event.preventDefault();
+        buttons[(index + (event.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => { window.removeEventListener("keydown", onKey, true); previous?.focus(); };
+  }, [Boolean(planSession)]);
+
   return (
-    <main className="app-shell">
+    <><main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-mark" src={appIcon} alt="" />
@@ -1008,10 +1218,10 @@ function MainApp() {
         </div>
         <button className={"new-note " + (status === "recording" ? "is-recording" : "")} onClick={toggleRecording}>
           <span className="new-note-icon">{status === "recording" ? "■" : "✦"}</span>
-          {status === "recording" ? "结束口述" : "开始口述"}
+          <span className="shortcut-action-label">{status === "recording" ? "结束口述" : "开始口述"}</span>
           <kbd>{formatShortcut(config.hotkey)}</kbd>
         </button>
-        <button className="selection-action" onClick={startEditSelection}><span>✎</span>编辑当前选区<kbd>{formatShortcut(config.editHotkey)}</kbd></button>
+        <button className="selection-action" onClick={() => void startEditSelection()}><span>✎</span>编辑当前选区<kbd>{formatShortcut(config.editHotkey)}</kbd></button>
         <nav className="nav-list">
           <NavButton icon="⌂" label="首页" active={view === "home"} onClick={() => setView("home")} />
           <NavButton icon="◉" label="口述工作台" active={view === "dictate"} onClick={() => setView("dictate")} />
@@ -1021,7 +1231,7 @@ function MainApp() {
         </nav>
         <div className="sidebar-foot">
           <div className="privacy-chip"><span className="dot green" />本地优先</div>
-          <p>语音默认在本机识别<br />渲染只调用你选择的模型</p>
+          <p>{config.asrProvider === "qwen" ? "语音发送至千问识别" : "语音在本机识别"}<br />历史记录只保存在本机</p>
         </div>
       </aside>
 
@@ -1038,7 +1248,7 @@ function MainApp() {
         </header>
 
         {view === "home" && (
-          <HomeView history={history} usageStats={usageStats} model={model} status={status} onStart={toggleRecording} onStartEdit={startEditSelection} onOpenDictate={() => setView("dictate")} onOpenHistory={() => setView("history")} onOpenSettings={() => setView("settings")} />
+          <HomeView config={config} asrTokenSet={asrTokenSet} history={history} usageStats={usageStats} model={model} status={status} onStart={toggleRecording} onStartEdit={() => void startEditSelection()} onOpenDictate={() => setView("dictate")} onOpenHistory={() => setView("history")} onOpenSettings={() => setView("settings")} />
         )}
         {view === "dictate" && (
           <DictateView
@@ -1051,10 +1261,11 @@ function MainApp() {
             operation={operation}
             selectedText={selectedText}
             onToggle={toggleRecording}
-            onStartEdit={startEditSelection}
+            onStartEdit={() => void startEditSelection()}
             onModeChange={(mode) => saveConfig({ mode })}
             onLanguageChange={(language) => saveConfig({ language })}
             onCopy={copyText}
+            onReview={openPlanReview}
           />
         )}
         {view === "history" && (
@@ -1072,6 +1283,7 @@ function MainApp() {
             onResetStats={() => setConfirmAction({ kind: "reset-stats" })}
             onUpdate={updateHistoryItem}
             onAddWord={addWord}
+            onReview={openPlanReview}
           />
         )}
         {view === "dictionary" && (
@@ -1111,6 +1323,7 @@ function MainApp() {
             onHotkey={captureHotkey}
             onApiKeyChange={setApiKeyInput}
             onSaveApiKey={saveApiKey}
+            cloudSettings={<CloudAsrSettings config={config} tokenSet={asrTokenSet} tokenInput={asrTokenInput} busy={asrTokenBusy} shareToken={shareAsrToken} feedback={statusMessage} onConfigChange={saveConfig} onTokenChange={setAsrTokenInput} onSave={() => void saveAsrToken()} onClear={() => void clearAsrToken()} onShareChange={(value) => { setShareAsrToken(value); if (asrTokenSet) saveConfig({ llmUseAsrToken: value }); }} />}
             onRefreshMicrophones={() => void listAudioInputs().then(setMicrophones)}
             onTestMicrophone={testMicrophone}
             onRefreshAccessibility={() => void refreshAccessibilityStatus()}
@@ -1134,7 +1347,7 @@ function MainApp() {
           onConfirm={confirm}
         />
       )}
-    </main>
+    </main>{planSession && createPortal(<PlanReviewView session={planSession} theme={config.theme} onClose={closePlanReview} onCheck={() => void checkPlan()} onCopy={copyText} onInsert={preparePlanInsertion} />, document.body)}</>
   );
 }
 
@@ -1142,20 +1355,20 @@ function NavButton({ icon, label, active, onClick }: { icon: string; label: stri
   return <button className={"nav-item " + (active ? "active" : "")} onClick={onClick}><span className="nav-icon">{icon}</span>{label}</button>;
 }
 
-function HomeView({ history, usageStats, model, status, onStart, onStartEdit, onOpenDictate, onOpenHistory, onOpenSettings }: { history: HistoryItem[]; usageStats: UsageStats; model: ModelStatus; status: AppStatus; onStart: () => void; onStartEdit: () => void; onOpenDictate: () => void; onOpenHistory: () => void; onOpenSettings: () => void }) {
+function HomeView({ config, asrTokenSet, history, usageStats, model, status, onStart, onStartEdit, onOpenDictate, onOpenHistory, onOpenSettings }: { config: AppConfig; asrTokenSet: boolean; history: HistoryItem[]; usageStats: UsageStats; model: ModelStatus; status: AppStatus; onStart: () => void; onStartEdit: () => void; onOpenDictate: () => void; onOpenHistory: () => void; onOpenSettings: () => void }) {
   return (
     <div className="page home-page">
       <section className="hero-card">
         <div className="hero-copy">
           <span className="hero-kicker">YOUR WORDS, YOUR FLOW</span>
           <h2>说出来，<br /><em>自然成稿。</em></h2>
-          <p>本地轻量语音识别，配合你自己的大模型，把口述变成清晰、可直接使用的文字。</p>
+          <p>本地 Whisper 或千问云端识别，配合文字整理，把口述变成清晰、可直接使用的文字。</p>
           <div className="hero-actions"><button className="primary-button" onClick={onStart}><span>●</span>{status === "recording" ? "结束口述" : "开始口述"}<kbd>⌘⇧空格</kbd></button><button className="secondary-button" onClick={onStartEdit}><span>✎</span>编辑选区</button></div>
         </div>
         <div className="hero-orb"><div className="orb-core" /><i /><i /><i /><i /></div>
       </section>
       <div className="stat-row">
-        <div className="stat-card"><span className="stat-label">本地 ASR</span><strong>{model.bundled ? "已内置" : model.installed ? "已就绪" : "待下载"}</strong><small>{model.installed ? formatBytes(model.sizeBytes) + " · " + model.name : "在设置中选择轻量模型"}</small></div>
+        <div className="stat-card"><span className="stat-label">{config.asrProvider === "qwen" ? "千问云端 ASR" : "本地 ASR"}</span><strong>{config.asrProvider === "qwen" ? asrTokenSet ? "已配置" : "待填写 Token" : model.bundled ? "已内置" : model.installed ? "已就绪" : "待下载"}</strong><small>{config.asrProvider === "qwen" ? "qwen3-asr-flash · " + (config.asrRegion === "beijing" ? "北京" : "新加坡") : model.installed ? formatBytes(model.sizeBytes) + " · " + model.name : "在设置中选择轻量模型"}</small></div>
         <div className="stat-card"><span className="stat-label">累计输出</span><strong>{formatCount(usageStats.totalOutputCharacters)} 字</strong><small>{formatCount(usageStats.totalSessions)} 次 · 只保存在本机</small></div>
         <div className="stat-card"><span className="stat-label">历史记录</span><strong>{history.length} 条</strong><small>只保存在本机</small></div>
       </div>
@@ -1163,50 +1376,51 @@ function HomeView({ history, usageStats, model, status, onStart, onStartEdit, on
         <div className="section-heading"><div><span className="section-kicker">RECENT CAPTURES</span><h3>最近记录</h3></div><button className="text-button" onClick={onOpenHistory}>查看全部 →</button></div>
         {history.length === 0 ? <div className="empty-card"><span>✦</span><p>你的第一段口述会出现在这里</p><small>按下快捷键，随时开始记录。</small></div> : <div className="history-list">{history.slice(0, 5).map((item) => <div className="history-item" key={item.id}><div className="history-time">{formatTime(item.createdAt)}</div><p>{item.renderedText}</p><span className="history-tag">{item.operation === "edit" ? "选区" : item.mode === "smart" ? "已渲染" : "原文"}</span></div>)}</div>}
       </section>
-      {!model.installed && <button className="inline-notice" onClick={onOpenSettings}><span>↓</span>还差一步：在设置中下载本地 ASR 模型</button>}
+      {config.asrProvider === "local" && !model.installed && <button className="inline-notice" onClick={onOpenSettings}><span>↓</span>还差一步：在设置中下载本地 ASR 模型</button>}
       <button className="inline-notice subtle-notice" onClick={onOpenDictate}><span>✓</span>提示：选中文字后按 {formatShortcut(DEFAULT_CONFIG.editHotkey)}，可以直接用语音改写选区</button>
     </div>
   );
 }
 
-function DictateView({ status, statusMessage, level, rawText, renderedText, config, operation, selectedText, onToggle, onStartEdit, onModeChange, onLanguageChange, onCopy }: { status: AppStatus; statusMessage: string; level: number; rawText: string; renderedText: string; config: AppConfig; operation: OperationMode; selectedText: string; onToggle: () => void; onStartEdit: () => void; onModeChange: (mode: DictationMode) => void; onLanguageChange: (language: AppConfig["language"]) => void; onCopy: (text: string) => void }) {
+function DictateView({ status, statusMessage, level, rawText, renderedText, config, operation, selectedText, onToggle, onStartEdit, onModeChange, onLanguageChange, onCopy, onReview }: { status: AppStatus; statusMessage: string; level: number; rawText: string; renderedText: string; config: AppConfig; operation: OperationMode; selectedText: string; onToggle: () => void; onStartEdit: () => void; onModeChange: (mode: DictationMode) => void; onLanguageChange: (language: AppConfig["language"]) => void; onCopy: (text: string) => void; onReview: (text: string) => void }) {
   return (
     <div className="page dictate-page">
-      <div className="toolbar"><div className="segmented"><button className={config.mode === "smart" ? "selected" : ""} onClick={() => onModeChange("smart")}>智能渲染</button><button className={config.mode === "translate" ? "selected" : ""} onClick={() => onModeChange("translate")}>翻译</button><button className={config.mode === "literal" ? "selected" : ""} onClick={() => onModeChange("literal")}>只转写</button></div><div className="toolbar-actions"><button className="outline-button" onClick={onStartEdit}><span>✎</span>编辑选区</button><label className="select-label">语言<select value={config.language} onChange={(event) => onLanguageChange(event.target.value as AppConfig["language"])}><option value="auto">自动</option><option value="zh">中文</option><option value="en">English</option></select></label></div></div>
+      <div className="toolbar"><div className="segmented"><button className={config.mode === "smart" ? "selected" : ""} onClick={() => onModeChange("smart")}>智能渲染</button><button className={config.mode === "translate" ? "selected" : ""} onClick={() => onModeChange("translate")}>翻译</button><button className={config.mode === "literal" ? "selected" : ""} onClick={() => onModeChange("literal")}>只转写</button></div><div className="toolbar-actions"><AsrLanguageSelect value={config.language} local={config.asrProvider === "local"} onChange={onLanguageChange} /></div></div>
       {operation === "edit" && selectedText && <div className="selection-preview"><span>当前选区</span><p>{selectedText}</p><small>录音结束后，结果会替换这段文字</small></div>}
       <section className={"record-panel " + (status === "recording" ? "recording" : "")}>
-        <div className="record-icon"><span className="mic-glyph">●</span></div>
+        <div className="record-icon"><span className="mic-glyph">{status === "error" ? "!" : "●"}</span></div>
         <div className="waveform">{Array.from({ length: 25 }, (_, index) => <i key={index} style={{ height: (8 + level * (20 + ((index * 17) % 23))) + "px" }} />)}</div>
         <strong>{status === "recording" ? operation === "edit" ? "正在聆听编辑指令…" : "正在聆听…" : statusMessage}</strong>
         <div className="record-actions"><button className="record-button" onClick={onToggle}>{status === "recording" ? <><span>✓</span>结束并整理</> : <><span>●</span>开始口述</>}</button><button className="cancel-button compact" onClick={onStartEdit}><span>✎</span>编辑选区</button></div>
         <small>口述 {formatShortcut(config.hotkey)} · 编辑 {formatShortcut(config.editHotkey)}</small>
       </section>
       <div className="text-columns">
-        <TextPanel title="语音转写" label="LOCAL ASR" text={rawText} empty="录音后会显示原始转写" onCopy={onCopy} />
-        <TextPanel title="渲染结果" label={operation === "edit" ? "SELECTION EDIT" : config.mode === "translate" ? "TRANSLATION" : config.mode === "smart" ? "LLM RENDER" : "LITERAL MODE"} text={renderedText} empty="整理后的文本会显示在这里" onCopy={onCopy} />
+        <TextPanel title="语音转写" label={config.asrProvider === "qwen" ? "CLOUD ASR" : "LOCAL ASR"} text={rawText} empty="录音后会显示原始转写" onCopy={onCopy} />
+        <TextPanel title="渲染结果" label={operation === "edit" ? "SELECTION EDIT" : config.mode === "translate" ? "TRANSLATION" : config.mode === "smart" ? "LLM RENDER" : "LITERAL MODE"} text={renderedText} empty="整理后的文本会显示在这里" onCopy={onCopy} processing={status} />
       </div>
       <div className="translation-hint"><span>✧</span>{operation === "edit" ? "选区编辑只处理你选中的文字，不会执行问答或网页搜索。" : `翻译目标：${config.translationTarget} · 默认风格：${presetLabel(config.defaultPreset)}`}</div>
+      {renderedText && <button className="quiet-button" onClick={() => onReview(renderedText)}>检查方案 · 主动确认后额外调用模型</button>}
     </div>
   );
 }
 
-function TextPanel({ title, label, text, empty, onCopy }: { title: string; label: string; text: string; empty: string; onCopy?: (text: string) => void }) {
+function TextPanel({ title, label, text, empty, onCopy, processing }: { title: string; label: string; text: string; empty: string; onCopy?: (text: string) => void; processing?: AppStatus }) {
   const stats = getTextStats(text);
-  return <section className="text-panel"><div className="panel-header"><div><span>{label}</span><h3>{title}</h3></div>{text && <div className="panel-actions"><small className="text-stats">{formatCount(stats.characterCount)} 字{stats.wordCount ? ` · ${formatCount(stats.wordCount)} 英文词` : ""}</small>{onCopy && <button className="copy-button" onClick={() => onCopy(text)}><span>✓</span>复制</button>}</div>}</div><div className={"text-content " + (!text ? "empty" : "")}>{text || empty}</div></section>;
+  return <section className="text-panel"><div className="panel-header"><div><span>{label}</span><h3>{title}</h3></div>{text && <div className="panel-actions"><small className="text-stats">{formatCount(stats.characterCount)} 字{stats.wordCount ? ` · ${formatCount(stats.wordCount)} 英文词` : ""}</small>{onCopy && <button className="copy-button" onClick={() => onCopy(text)}><span>✓</span>复制</button>}</div>}</div><div className={"text-content " + (!text ? "empty" : "")}>{processing === "transcribing" || processing === "rendering" ? <ProcessingProgress stage={processing} /> : text || empty}</div></section>;
 }
 
-function HistoryView({ history, usageStats, query, filter, onQueryChange, onFilterChange, onCopy, onInsert, onDelete, onClear, onResetStats, onUpdate, onAddWord }: { history: HistoryItem[]; usageStats: UsageStats; query: string; filter: HistoryFilter; onQueryChange: (value: string) => void; onFilterChange: (filter: HistoryFilter) => void; onCopy: (text: string) => void; onInsert: (text: string) => void; onDelete: (id: string) => void; onClear: () => void; onResetStats: () => void; onUpdate: (id: string, text: string) => void; onAddWord: (word: string) => void }) {
+function HistoryView({ history, usageStats, query, filter, onQueryChange, onFilterChange, onCopy, onInsert, onDelete, onClear, onResetStats, onUpdate, onAddWord, onReview }: { history: HistoryItem[]; usageStats: UsageStats; query: string; filter: HistoryFilter; onQueryChange: (value: string) => void; onFilterChange: (filter: HistoryFilter) => void; onCopy: (text: string) => void; onInsert: (text: string) => void; onDelete: (id: string) => void; onClear: () => void; onResetStats: () => void; onUpdate: (id: string, text: string) => void; onAddWord: (word: string) => void; onReview: (text: string) => void }) {
   return <div className="page history-page">
     <div className="intro-row">
       <div className="intro-block compact"><span className="section-kicker">LOCAL ARCHIVE</span><h2>找回说过的话。</h2><p>历史只保存在本机。可以查看原始转写和整理结果，复制、重新插入或编辑内容。累计输出 {formatCount(usageStats.totalOutputCharacters)} 字。</p></div>
       <div className="history-head-actions"><button className="quiet-button" onClick={onResetStats} disabled={!usageStats.totalSessions}>重置统计</button><button className="danger-button" disabled={!history.length} onClick={onClear}><span>×</span>清空历史</button></div>
     </div>
     <div className="history-toolbar"><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索转写、应用或内容" /><div className="segmented small-segmented"><button className={filter === "all" ? "selected" : ""} onClick={() => onFilterChange("all")}>全部</button><button className={filter === "dictate" ? "selected" : ""} onClick={() => onFilterChange("dictate")}>口述</button><button className={filter === "edit" ? "selected" : ""} onClick={() => onFilterChange("edit")}>选区编辑</button></div></div>
-    {history.length === 0 ? <div className="empty-card"><span>≡</span><p>没有匹配的记录</p><small>完成一段口述后，它会自动出现在这里。</small></div> : <div className="history-cards">{history.map((item) => <HistoryCard key={item.id} item={item} onCopy={onCopy} onInsert={onInsert} onDelete={onDelete} onUpdate={onUpdate} onAddWord={onAddWord} />)}</div>}
+    {history.length === 0 ? <div className="empty-card"><span>≡</span><p>没有匹配的记录</p><small>完成一段口述后，它会自动出现在这里。</small></div> : <div className="history-cards">{history.map((item) => <HistoryCard key={item.id} item={item} onCopy={onCopy} onInsert={onInsert} onDelete={onDelete} onUpdate={onUpdate} onAddWord={onAddWord} onReview={onReview} />)}</div>}
   </div>;
 }
 
-function HistoryCard({ item, onCopy, onInsert, onDelete, onUpdate, onAddWord }: { item: HistoryItem; onCopy: (text: string) => void; onInsert: (text: string) => void; onDelete: (id: string) => void; onUpdate: (id: string, text: string) => void; onAddWord: (word: string) => void }) {
+function HistoryCard({ item, onCopy, onInsert, onDelete, onUpdate, onAddWord, onReview }: { item: HistoryItem; onCopy: (text: string) => void; onInsert: (text: string) => void; onDelete: (id: string) => void; onUpdate: (id: string, text: string) => void; onAddWord: (word: string) => void; onReview: (text: string) => void }) {
   const [editing, setEditing] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const [draft, setDraft] = useState(item.renderedText);
@@ -1215,10 +1429,12 @@ function HistoryCard({ item, onCopy, onInsert, onDelete, onUpdate, onAddWord }: 
   const renderedStats = item.stats?.rendered || getTextStats(text);
   const timing = item.timing;
   return <article className="history-card">
-    <div className="history-card-head"><div><span className="history-time">{formatTime(item.createdAt)}</span><span className="history-tag">{item.operation === "edit" ? "选区编辑" : item.mode === "translate" ? "翻译" : item.mode === "literal" ? "原文" : presetLabel(item.preset || "general")}</span>{item.appName && <span className="history-app">{item.appName}</span>}{item.usedLlm === false && <span className="history-source-tag">本地原文</span>}</div><button className="icon-action danger" onClick={() => onDelete(item.id)} aria-label="删除记录">×</button></div>
+    <div className="history-card-head"><div><span className="history-time">{formatTime(item.createdAt)}</span><span className="history-tag">{item.operation === "edit" ? "选区编辑" : item.mode === "translate" ? "翻译" : item.mode === "literal" ? "原文" : presetLabel(item.preset || "general")}</span>{item.appName && <span className="history-app">{item.appName}</span>}{item.usedLlm === false && <span className="history-source-tag">原始转写</span>}</div><button className="icon-action danger" onClick={() => onDelete(item.id)} aria-label="删除记录">×</button></div>
     {item.operation === "edit" && item.selectedText && <div className="history-selection"><span>原选区</span>{item.selectedText}</div>}
     <div className="history-result-label"><span>最终输出</span><small>{formatCount(renderedStats.characterCount)} 字{renderedStats.wordCount ? ` · ${formatCount(renderedStats.wordCount)} 英文词` : ""}</small></div>
     {editing ? <textarea className="history-editor" value={draft} onChange={(event) => setDraft(event.target.value)} /> : <p className="history-card-text">{text}</p>}
+    {showRaw && item.generatedText && item.generatedText !== item.renderedText && <section className="history-source"><span>首次生成正文 · 编辑前</span><p>{item.generatedText}</p></section>}
+    {!editing && <button className="quiet-button" onClick={() => onReview(text)}>检查方案</button>}
     {showRaw && <section className="history-source"><div className="history-source-head"><span>原始转写 · {formatCount(rawStats.characterCount)} 字</span>{item.rawText && <button className="quiet-button" onClick={() => onCopy(item.rawText)}>复制原文</button>}</div><p>{item.rawText || "没有原始转写"}</p>{item.canonicalText && item.canonicalText !== item.rawText && <><div className="history-source-head"><span>候选裁决后</span></div><p>{item.canonicalText}</p></>}{(item.candidates?.length || 0) > 1 && <div className="history-candidates"><div className="history-source-head"><span>各模型候选 · 概率仅供参考，并非准确率</span></div>{item.candidates?.map((candidate) => <div className="history-candidate" key={candidate.model}><strong>{candidate.model}</strong><p>{candidate.text || "（无文字）"}</p></div>)}</div>}{Boolean(item.warnings?.length) && <p className="history-warnings">{item.warnings?.join("；")}</p>}</section>}
     {timing && <div className="history-timing"><span>转写完成 {formatStageTime(timing.transcribedAt)}</span><span>渲染完成 {formatStageTime(timing.renderedAt)}</span><span>识别 {formatDuration(timing.asrMs)}</span><span>整理 {formatDuration(timing.renderMs)}</span></div>}
     <div className="history-card-foot">{editing ? <><button className="cancel-button compact" onClick={() => { setDraft(item.renderedText); setEditing(false); }}><span>×</span>放弃</button><button className="confirm-button compact" onClick={() => { onUpdate(item.id, draft); setEditing(false); }}><span>✓</span>保存</button></> : <><button className="quiet-button" onClick={() => setShowRaw((value) => !value)}>{showRaw ? "收起原文" : "查看原始转写"}</button><button className="quiet-button" onClick={() => onCopy(text)}>复制结果</button><button className="quiet-button" onClick={() => onInsert(text)}>重新插入</button><button className="quiet-button" onClick={() => onAddWord(item.rawText)}>加入词典</button><button className="quiet-button" onClick={() => setEditing(true)}>编辑</button></>}</div>
@@ -1226,33 +1442,35 @@ function HistoryCard({ item, onCopy, onInsert, onDelete, onUpdate, onAddWord }: 
 }
 
 function DictionaryView({ words, newWord, editingWord, editingWordValue, onChange, onAdd, onRemove, onEdit, onEditingValueChange, onSaveEdit, onCancelEdit, onImport, onExport }: { words: string[]; newWord: string; editingWord: string | null; editingWordValue: string; onChange: (value: string) => void; onAdd: () => void; onRemove: (word: string) => void; onEdit: (word: string) => void; onEditingValueChange: (value: string) => void; onSaveEdit: () => void; onCancelEdit: () => void; onImport: (file: File | null) => void; onExport: () => void }) {
-  return <div className="page narrow-page"><section className="intro-block"><span className="section-kicker">PERSONAL VOCABULARY</span><h2>让它听懂你的世界。</h2><p>加入人名、产品名、专业术语或常用表达。它们会同时提供给本地 ASR 和渲染模型。</p></section><div className="add-word"><input value={newWord} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") onAdd(); }} placeholder="输入一个词，例如：U-Words" /><button className="primary-button small" onClick={onAdd}><span>✓</span>添加</button></div><div className="dictionary-actions"><label className="file-button"><span>↓</span>导入 CSV<input type="file" accept=".csv,.txt" onChange={(event: ChangeEvent<HTMLInputElement>) => { void onImport(event.target.files?.[0] || null); event.target.value = ""; }} /></label><button className="quiet-button" onClick={onExport} disabled={!words.length}>导出 CSV</button><span>{words.length} 个词条</span></div><div className="word-list">{words.length === 0 ? <div className="empty-card"><span>⌘</span><p>词典还是空的</p><small>从一个你经常说错的词开始。</small></div> : words.map((word) => editingWord === word ? <div className="word-row editing" key={word}><input value={editingWordValue} onChange={(event) => onEditingValueChange(event.target.value)} autoFocus /><div><button className="icon-action" onClick={onCancelEdit} aria-label="取消编辑">×</button><button className="icon-action confirm" onClick={onSaveEdit} aria-label="保存词条">✓</button></div></div> : <div className="word-row" key={word}><span>{word}</span><div><button className="quiet-button" onClick={() => onEdit(word)}>编辑</button><button className="icon-action danger" onClick={() => onRemove(word)} aria-label={`移除 ${word}`}>×</button></div></div>)}</div></div>;
+  return <div className="page narrow-page"><section className="intro-block"><span className="section-kicker">PERSONAL VOCABULARY</span><h2>让它听懂你的世界。</h2><p>加入人名、产品名、专业术语或常用表达。它们会提供给所选 ASR 和文字整理模型。</p></section><div className="add-word"><input value={newWord} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") onAdd(); }} placeholder="输入一个词，例如：U-Words" /><button className="primary-button small" onClick={onAdd}><span>✓</span>添加</button></div><div className="dictionary-actions"><label className="file-button"><span>↓</span>导入 CSV<input type="file" accept=".csv,.txt" onChange={(event: ChangeEvent<HTMLInputElement>) => { void onImport(event.target.files?.[0] || null); event.target.value = ""; }} /></label><button className="quiet-button" onClick={onExport} disabled={!words.length}>导出 CSV</button><span>{words.length} 个词条</span></div><div className="word-list">{words.length === 0 ? <div className="empty-card"><span>⌘</span><p>词典还是空的</p><small>从一个你经常说错的词开始。</small></div> : words.map((word) => editingWord === word ? <div className="word-row editing" key={word}><input value={editingWordValue} onChange={(event) => onEditingValueChange(event.target.value)} autoFocus /><div><button className="icon-action" onClick={onCancelEdit} aria-label="取消编辑">×</button><button className="icon-action confirm" onClick={onSaveEdit} aria-label="保存词条">✓</button></div></div> : <div className="word-row" key={word}><span>{word}</span><div><button className="quiet-button" onClick={() => onEdit(word)}>编辑</button><button className="icon-action danger" onClick={() => onRemove(word)} aria-label={`移除 ${word}`}>×</button></div></div>)}</div></div>;
 }
 
-function SettingsView({ config, model, modelBusy, apiKeySet, apiKeyInput, hotkeyError, microphones, micState, accessibilityTrusted, activeApp, profileApp, profilePreset, onConfigChange, onProviderPreset, onModelActivate, onHotkey, onApiKeyChange, onSaveApiKey, onRefreshMicrophones, onTestMicrophone, onRefreshAccessibility, onOpenAccessibilitySettings, onProfileAppChange, onProfilePresetChange, onAddProfile, onRemoveProfile }: { config: AppConfig; model: ModelStatus; modelBusy: string | null; apiKeySet: boolean; apiKeyInput: string; hotkeyError: string; microphones: MediaDeviceInfo[]; micState: MicState; accessibilityTrusted: boolean | null; activeApp: string; profileApp: string; profilePreset: PromptPresetId; onConfigChange: (patch: Partial<AppConfig>) => void; onProviderPreset: (name: string) => void; onModelActivate: (model: ModelOption) => void; onHotkey: (event: ReactKeyboardEvent<HTMLInputElement>, field: "hotkey" | "editHotkey") => void; onApiKeyChange: (value: string) => void; onSaveApiKey: () => void; onRefreshMicrophones: () => void; onTestMicrophone: () => void; onRefreshAccessibility: () => void; onOpenAccessibilitySettings: () => void; onProfileAppChange: (value: string) => void; onProfilePresetChange: (value: PromptPresetId) => void; onAddProfile: () => void; onRemoveProfile: (appName: string) => void }) {
+function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiKeyInput, hotkeyError, microphones, micState, accessibilityTrusted, activeApp, profileApp, profilePreset, onConfigChange, onProviderPreset, onModelActivate, onHotkey, onApiKeyChange, onSaveApiKey, onRefreshMicrophones, onTestMicrophone, onRefreshAccessibility, onOpenAccessibilitySettings, onProfileAppChange, onProfilePresetChange, onAddProfile, onRemoveProfile }: { config: AppConfig; cloudSettings: ReactNode; model: ModelStatus; modelBusy: string | null; apiKeySet: boolean; apiKeyInput: string; hotkeyError: string; microphones: MediaDeviceInfo[]; micState: MicState; accessibilityTrusted: boolean | null; activeApp: string; profileApp: string; profilePreset: PromptPresetId; onConfigChange: (patch: Partial<AppConfig>) => void; onProviderPreset: (name: string) => void; onModelActivate: (model: ModelOption) => void; onHotkey: (event: ReactKeyboardEvent<HTMLInputElement>, field: "hotkey" | "editHotkey") => void; onApiKeyChange: (value: string) => void; onSaveApiKey: () => void; onRefreshMicrophones: () => void; onTestMicrophone: () => void; onRefreshAccessibility: () => void; onOpenAccessibilitySettings: () => void; onProfileAppChange: (value: string) => void; onProfilePresetChange: (value: PromptPresetId) => void; onAddProfile: () => void; onRemoveProfile: (appName: string) => void }) {
   return <div className="page settings-page">
     <SettingsGroup title="外观" hint="黑白界面，可在浅色与高级灰深色模式之间切换；选择会自动保存。">
       <div className="setting-row"><div><strong>界面模式</strong><small>{config.theme === "dark" ? "高级灰深色" : "黑白浅色"}</small></div><div className="segmented small-segmented"><button className={config.theme === "light" ? "selected" : ""} onClick={() => onConfigChange({ theme: "light" })}>浅色</button><button className={config.theme === "dark" ? "selected" : ""} onClick={() => onConfigChange({ theme: "dark" })}>深色</button></div></div>
     </SettingsGroup>
-    <SettingsGroup title="本地语音识别" hint="Whisper 在本机运行；默认 Small Q5 已随应用内置，tiny/base 可按设备性能选择，模型文件不会发送给大模型服务商。">
+    {cloudSettings}
+    <SettingsGroup title="本地语音识别" hint="仅在本地模式或云端失败回退时使用。默认 Small Q5 已内置；本地识别不上传音频。">
       <div className="setting-row"><div><strong>识别方式</strong><small>{config.recognitionQuality === "ensemble" ? "高精度：短录音使用已安装的多个模型生成候选，再由大模型保守裁决；会更慢且增加调用" : "快速：仅使用当前模型；响应更快"}</small></div><div className="segmented small-segmented"><button className={config.recognitionQuality === "fast" ? "selected" : ""} onClick={() => onConfigChange({ recognitionQuality: "fast" })}>快速</button><button className={config.recognitionQuality === "ensemble" ? "selected" : ""} onClick={() => onConfigChange({ recognitionQuality: "ensemble" })}>高精度</button></div></div>
       {config.recognitionQuality === "ensemble" && <div className="setting-note">已安装 {model.models.filter((option) => option.installed).length} 个模型。10 秒内可用 tiny/base/small；10–30 秒可用 base/small；更长录音只运行当前模型。智能渲染和翻译会把候选文字发送至所配置的大模型，不上传音频；只转写模式仍输出主模型原文。模型裁决无法保证绝对正确。</div>}
       <div className="model-list">{(model.models.length ? model.models : [{ id: config.activeModel, name: "Whisper small · Q5", description: "默认高准确率模型", installed: model.installed, bundled: model.bundled, active: true, sizeBytes: model.sizeBytes }]).map((option) => <div className="model-row" key={option.id}><div><strong>{option.name}</strong><small>{option.description}{option.bundled ? " · 随应用内置" : ""}{option.installed ? ` · ${formatBytes(option.sizeBytes)}` : ""}</small></div><button className={option.active ? "confirm-button compact" : "outline-button"} disabled={modelBusy !== null} onClick={() => onModelActivate(option)}>{modelBusy === option.id ? "准备中…" : option.active ? <><span>✓</span>当前使用</> : option.installed ? "切换" : "下载"}</button></div>)}</div>
     </SettingsGroup>
-    <SettingsGroup title="麦克风与录音" hint="首次测试会触发系统麦克风权限。没有说话超过设定时间时，VAD 可以自动结束录音。">
+    <SettingsGroup title="麦克风与录音" hint="首次测试会触发系统麦克风权限。停顿或长时间静音不会自动结束录音；请按完成按钮或再次按口述快捷键结束，Esc 可取消。">
       <div className="setting-row stacked"><label>输入设备</label><div className="inline-field"><select value={config.selectedMicId} onChange={(event) => onConfigChange({ selectedMicId: event.target.value })}><option value="">系统默认麦克风</option>{microphones.filter((device) => device.deviceId !== "default").map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 6)}`}</option>)}</select><button className="quiet-button" onClick={onRefreshMicrophones}>刷新</button></div></div>
       <div className="setting-row"><div><strong>麦克风测试</strong><small>{micState === "ok" ? "✓ 输入正常" : micState === "error" ? "× 无法访问，请检查系统权限" : "测试输入电平和系统权限"}</small></div><button className="outline-button" onClick={onTestMicrophone}>开始测试</button></div>
       <div className="setting-row"><div><strong>噪声抑制</strong><small>交给系统音频输入做基础降噪</small></div><Toggle value={config.noiseSuppression} onChange={() => onConfigChange({ noiseSuppression: !config.noiseSuppression })} /></div>
-      <div className="setting-row"><div><strong>静音自动结束</strong><small>连续无声 {config.autoStopSeconds} 秒后结束并整理</small></div><div className="inline-field"><Toggle value={config.vadEnabled} onChange={() => onConfigChange({ vadEnabled: !config.vadEnabled })} /><select value={config.autoStopSeconds} onChange={(event) => onConfigChange({ autoStopSeconds: Number(event.target.value) })}><option value={1}>1 秒</option><option value={2}>2 秒</option><option value={3}>3 秒</option><option value={5}>5 秒</option></select></div></div>
     </SettingsGroup>
     <SettingsGroup title="macOS 权限" hint="自动插入文字和编辑当前选区需要辅助功能权限；应用不会在未授权时反复模拟快捷键。">
       <div className="setting-row"><div><strong>辅助功能</strong><small>{accessibilityTrusted === null ? "正在检查权限状态…" : accessibilityTrusted ? "✓ 已授权，可跨应用读取选区和插入文字" : "× 尚未授权，语音仍可识别，但无法自动插入或编辑选区"}</small></div><div className="inline-field">{accessibilityTrusted === false && <button className="outline-button" onClick={onOpenAccessibilitySettings}>打开系统设置</button>}<button className="quiet-button" onClick={onRefreshAccessibility}>重新检测</button></div></div>
     </SettingsGroup>
     <SettingsGroup title="快捷键、常驻与输出" hint="主快捷键用于口述；编辑快捷键会读取当前应用的选中文字并在完成后替换它。录音或处理中按 Esc 可取消。">
+      <div className="setting-row"><div><strong>录音触发方式</strong><small>切换：再按一次结束；按住：松开触发键结束。页面按钮仍为点击开始/结束</small></div><div className="segmented small-segmented"><button className={config.recordingMode === "toggle" ? "selected" : ""} onClick={() => onConfigChange({ recordingMode: "toggle" })}>切换</button><button className={config.recordingMode === "hold" ? "selected" : ""} onClick={() => onConfigChange({ recordingMode: "hold" })}>按住</button></div></div>
+      <div className="setting-row"><div><strong>连续口述参考上一段</strong><small>默认关闭。启用后，仅智能整理在同一可识别控件、30 秒内参考上一段最多 400 字，将随本次文字发送至所配置模型，不重复输出上一段</small></div><Toggle value={config.linkPreviousDictation} onChange={() => onConfigChange({ linkPreviousDictation: !config.linkPreviousDictation })} /></div>
       <div className="setting-row"><div><strong>口述快捷键</strong><small>点击输入框后按下组合键</small></div><input className="compact-input" value={config.hotkey} onKeyDown={(event) => onHotkey(event, "hotkey")} readOnly /></div>
       <div className="setting-row"><div><strong>选区编辑快捷键</strong><small>先选中文字，再使用这个快捷键</small></div><input className="compact-input" value={config.editHotkey} onKeyDown={(event) => onHotkey(event, "editHotkey")} readOnly /></div>
       <div className="setting-row"><div><strong>完成后自动插入</strong><small>将结果粘贴到当前光标或替换当前选区</small></div><Toggle value={config.autoInsert} onChange={() => onConfigChange({ autoInsert: !config.autoInsert })} /></div>
-      <div className="setting-row"><div><strong>渲染失败时回退原文</strong><small>网络或 API 失败时，仍然插入本地 ASR 结果</small></div><Toggle value={config.fallbackToLiteral} onChange={() => onConfigChange({ fallbackToLiteral: !config.fallbackToLiteral })} /></div>
+      <div className="setting-row"><div><strong>渲染失败时回退原文</strong><small>网络或 API 失败时，仍然插入 ASR 原始转写</small></div><Toggle value={config.fallbackToLiteral} onChange={() => onConfigChange({ fallbackToLiteral: !config.fallbackToLiteral })} /></div>
       <div className="setting-row"><div><strong>开机自动启动</strong><small>后台常驻后可以直接使用全局快捷键；关闭窗口只会隐藏应用</small></div><Toggle value={config.launchAtLogin} onChange={() => onConfigChange({ launchAtLogin: !config.launchAtLogin })} /></div>
       {hotkeyError && <div className="error-note">{hotkeyError}</div>}
     </SettingsGroup>
@@ -1263,17 +1481,36 @@ function SettingsView({ config, model, modelBusy, apiKeySet, apiKeyInput, hotkey
       {config.appProfiles.length > 0 && <div className="profile-list">{config.appProfiles.map((profile: AppProfile) => <div className="profile-row" key={profile.appName}><span>{profile.appName}</span><span className="history-tag">{presetLabel(profile.preset)}</span><button className="icon-action danger" onClick={() => onRemoveProfile(profile.appName)} aria-label={`移除 ${profile.appName}`}>×</button></div>)}</div>}
     </SettingsGroup>
     <SettingsGroup title="大模型渲染" hint="仅在智能渲染、翻译或选区编辑时调用。API Key 使用系统凭据库保存，不写入前端或普通配置文件。">
-      <div className="setting-row stacked"><label>服务商</label><select value={config.llmProvider} onChange={(event) => onProviderPreset(event.target.value)}>{PROVIDER_PRESETS.map((preset) => <option key={preset.name} value={preset.name}>{preset.name}</option>)}</select></div>
-      <div className="setting-row stacked"><label>Base URL</label><input value={config.llmBaseUrl} onChange={(event) => onConfigChange({ llmBaseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></div>
-      <div className="setting-row stacked"><label>Model</label><input value={config.llmModel} onChange={(event) => onConfigChange({ llmModel: event.target.value })} placeholder="model-name" /></div>
-      <div className="setting-row stacked"><label>API Key <span className="key-state">{apiKeySet ? "已设置" : "未设置"}</span></label><div className="key-input"><input type="password" value={apiKeyInput} onChange={(event) => onApiKeyChange(event.target.value)} placeholder={apiKeySet ? "输入新 Key 以替换，留空不修改" : "粘贴你的 API Key"} /><button className="outline-button" onClick={onSaveApiKey}>{apiKeySet && !apiKeyInput ? <><span>×</span>清除</> : <><span>✓</span>保存</>}</button></div></div>
+      {config.llmUseAsrToken ? <div className="setting-note">当前使用千问 qwen-plus，复用所选地域的百炼 Token，无需再次填写。识别与文字整理分别计费。关闭上方“同一 Token 用于文字整理”即可恢复原服务商配置。</div> : <>
+        <div className="setting-row stacked"><label>服务商</label><select value={config.llmProvider} onChange={(event) => onProviderPreset(event.target.value)}>{PROVIDER_PRESETS.map((preset) => <option key={preset.name} value={preset.name}>{preset.name}</option>)}</select></div>
+        <div className="setting-row stacked"><label>Base URL</label><input value={config.llmBaseUrl} onChange={(event) => onConfigChange({ llmBaseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></div>
+        <div className="setting-row stacked"><label>Model</label><input value={config.llmModel} onChange={(event) => onConfigChange({ llmModel: event.target.value })} placeholder="model-name" /></div>
+        <div className="setting-row stacked"><label>API Key <span className="key-state">{apiKeySet ? "已设置" : "未设置"}</span></label><div className="key-input"><input type="password" value={apiKeyInput} onChange={(event) => onApiKeyChange(event.target.value)} placeholder={apiKeySet ? "输入新 Key 以替换，留空不修改" : "粘贴你的 API Key"} /><button className="outline-button" onClick={onSaveApiKey}>{apiKeySet && !apiKeyInput ? <><span>×</span>清除</> : <><span>✓</span>保存</>}</button></div></div>
+      </>}
       <div className="setting-row"><div><strong>默认目标语言</strong><small>用于翻译型口述</small></div><select value={config.translationTarget} onChange={(event) => onConfigChange({ translationTarget: event.target.value as AppConfig["translationTarget"] })}><option value="中文">中文</option><option value="English">English</option></select></div>
     </SettingsGroup>
     <SettingsGroup title="历史保留" hint="历史记录默认只保存在本机，不保存原始音频。">
       <div className="setting-row"><div><strong>保留时间</strong><small>超过时间的历史会在应用启动或设置变更时清理</small></div><select value={config.historyRetention} onChange={(event) => onConfigChange({ historyRetention: event.target.value as HistoryRetention })}><option value="1">1 天</option><option value="7">7 天</option><option value="30">30 天</option><option value="forever">永久</option></select></div>
     </SettingsGroup>
-    <div className="about-note"><span>◌</span><div><strong>U-Words 0.5.0</strong><p>个人向、无搜索、无问答。内置 Whisper Small Q5，支持黑白双主题、候选转写与后台悬浮窗。</p></div></div>
+<div className="about-note"><span>◌</span><div><strong>U-Words 0.6.7</strong><p>录音双模式、阶段进度、快速音量波形与保守上下句衔接</p></div></div>
   </div>;
+}
+
+function CloudAsrSettings({ config, tokenSet, tokenInput, busy, shareToken, feedback, onConfigChange, onTokenChange, onSave, onClear, onShareChange }: {
+  config: AppConfig; tokenSet: boolean; tokenInput: string; busy: boolean; shareToken: boolean; feedback: string;
+  onConfigChange: (patch: Partial<AppConfig>) => void; onTokenChange: (value: string) => void;
+  onSave: () => void; onClear: () => void; onShareChange: (value: boolean) => void;
+}) {
+  return <SettingsGroup title="语音识别来源" hint="千问接口和模型已预设，粘贴百炼 API Token 后点击保存即可启用。Token 只保存在系统凭据库，保存不会发送测试音频或产生模型调用。">
+    <div className="setting-row"><div><strong>识别来源</strong><small>{config.asrProvider === "qwen" ? "录音结束后上传至百炼识别，历史仍只在本机保存" : "Whisper 离线识别，不上传音频"}</small></div><select aria-label="识别来源" value={config.asrProvider} onChange={(event) => onConfigChange({ asrProvider: event.target.value as AppConfig["asrProvider"] })} disabled={busy}><option value="local">本地 Whisper</option><option value="qwen">千问云端</option></select></div>
+    <div className="setting-row"><div><strong>服务地域</strong><small>默认北京；仅新加坡 Token 需要切换。两个地域的 Token 分别保存。</small></div><select aria-label="千问服务地域" value={config.asrRegion} onChange={(event) => onConfigChange({ asrRegion: event.target.value as AppConfig["asrRegion"] })} disabled={busy}><option value="beijing">北京（默认）</option><option value="singapore">新加坡</option></select></div>
+    <div className="setting-row stacked cloud-token-row"><label htmlFor="asr-token">百炼 Token <span className="key-state">{tokenSet ? "已保存 · 未联网验证" : "待填写"}</span></label><div className="key-input"><input id="asr-token" type="password" autoComplete="off" spellCheck={false} value={tokenInput} onChange={(event) => onTokenChange(event.target.value)} placeholder={tokenSet ? "粘贴新 Token 以替换" : "粘贴百炼 API Key（sk-…）"} disabled={busy} /><button className="outline-button" disabled={busy || !tokenInput.trim()} onClick={onSave}>{busy ? "保存中…" : "保存并启用"}</button>{tokenSet && <button className="quiet-button" disabled={busy} onClick={onClear}>清除 Token</button>}</div></div>
+    <div className="setting-note" role="status" aria-live="polite">{feedback}</div>
+    <div className="setting-row"><div><strong>同一 Token 用于文字整理</strong><small>使用 qwen-plus 完成整理与翻译；原 DeepSeek / 智谱配置保留，不覆盖其 Key。</small></div><button className={"toggle " + (shareToken ? "on" : "")} role="switch" aria-checked={shareToken} aria-label="同一 Token 用于文字整理" disabled={busy} onClick={() => onShareChange(!shareToken)}><span /></button></div>
+    <div className="setting-row"><div><strong>网络失败回退本地</strong><small>网络、超时、限流和服务端失败可回退；无效 Token 或权限错误会明确提示。</small></div><Toggle value={config.asrFallbackLocal} onChange={() => onConfigChange({ asrFallbackLocal: !config.asrFallbackLocal })} /></div>
+    <div className="setting-row"><div><strong>数字标准化</strong><small>将“一百二十三”等转为“123”；默认关闭，保留原始转写表达。</small></div><Toggle value={config.asrEnableItn} onChange={() => onConfigChange({ asrEnableItn: !config.asrEnableItn })} /></div>
+    <div className="setting-note">识别模型：qwen3-asr-flash。支持中英文和混说；个人词典作为识别上下文。音频会离开本机并提交至所选百炼地域，识别与整理分别按服务商规则计费。16 kHz WAV 的 Base64 有 10 MB 限制，建议每段不超过约 3 分钟。</div>
+  </SettingsGroup>;
 }
 
 function SettingsGroup({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
@@ -1292,7 +1529,7 @@ function ActionOverlay({ status, message, level, operation, text, onCancel, onFi
 }
 
 function ConfirmDialog({ title, message, onCancel, onConfirm }: { title: string; message: string; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="modal-backdrop" role="presentation"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button className="dialog-close" onClick={onCancel} aria-label="取消">×</button><div className="dialog-mark">?</div><h3 id="confirm-title">{title}</h3><p>{message}</p><div className="dialog-actions"><button className="cancel-button" onClick={onCancel}><span>×</span>取消</button><button className="confirm-button" onClick={onConfirm}><span>✓</span>确认</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button className="dialog-close" onClick={onCancel} aria-label="取消">×</button><div className="dialog-mark">?</div><h3 id="confirm-title">{title}</h3><p>{message}</p><div className="dialog-actions"><button className="cancel-button" onClick={onCancel}>取消</button><button className="confirm-button" onClick={onConfirm}><span>✓</span>确认</button></div></section></div>;
 }
 
 const INITIAL_OVERLAY_STATE: OverlayState = {
@@ -1306,6 +1543,8 @@ const INITIAL_OVERLAY_STATE: OverlayState = {
 
 function OverlayApp() {
   const [state, setState] = useState<OverlayState>(INITIAL_OVERLAY_STATE);
+  const [copyFeedback, setCopyFeedback] = useState("");
+  useEffect(() => { setCopyFeedback(""); }, [state.text, state.status]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = state.theme;
@@ -1328,12 +1567,12 @@ function OverlayApp() {
   }, []);
 
   useEffect(() => {
-    if (state.status !== "ready" && state.status !== "error") return;
+    if (state.preview || (state.status !== "ready" && state.status !== "error")) return;
     const timeout = window.setTimeout(() => {
       void native.hideOverlay().catch(() => undefined);
     }, state.status === "ready" ? 900 : 4500);
     return () => window.clearTimeout(timeout);
-  }, [state.status]);
+  }, [state.status, state.preview]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1347,53 +1586,17 @@ function OverlayApp() {
   }, []);
 
   const sendCommand = (command: OverlayCommand) => {
+    if (command === "copy") {
+      void native.copyText(state.text).then(() => setCopyFeedback("已复制"), () => setCopyFeedback("复制失败，请重试"));
+      return;
+    }
     void emitTo("main", OVERLAY_COMMAND_EVENT, command).catch(() => undefined);
     if (command === "cancel" || command === "dismiss") void native.hideOverlay().catch(() => undefined);
   };
-  const level = Math.max(0, Math.min(1, state.level));
-  const label = state.operation === "edit" ? "选区编辑" : "口述";
-
-  if (state.status === "idle") return <div className="overlay-root" aria-hidden="true" />;
-
-  if (state.status === "recording") {
-    return <main className="overlay-root" title={state.message}>
-      <section className="floating-overlay floating-recording" role="status" aria-label={`${label}录音中`}>
-        <button className="floating-action floating-cancel" onClick={() => sendCommand("cancel")} aria-label="取消录音" title="取消">×</button>
-        <div className="floating-meter" aria-label="实时音量">
-          {Array.from({ length: 11 }, (_, index) => <i key={index} style={{ height: `${4 + Math.max(.08, level) * (7 + (index % 4) * 5)}px`, opacity: level > .02 ? 1 : .45 }} />)}
-        </div>
-        <button className="floating-action floating-confirm" onClick={() => sendCommand("finish")} aria-label="完成录音" title="完成">✓</button>
-      </section>
-    </main>;
-  }
-
-  if (state.status === "transcribing" || state.status === "rendering") {
-    return <main className="overlay-root" title={state.message}>
-      <section className="floating-overlay floating-processing" role="status" aria-label={state.message}>
-        <span className="floating-spinner" />
-        <div className="floating-processing-meter">{Array.from({ length: 7 }, (_, index) => <i key={index} style={{ height: `${5 + (index % 3) * 3}px` }} />)}</div>
-        <button className="floating-action floating-cancel" onClick={() => sendCommand("cancel")} aria-label="取消处理" title="取消">×</button>
-      </section>
-    </main>;
-  }
-
-  if (state.status === "ready") {
-    return <main className="overlay-root" title={state.message}>
-      <section className="floating-overlay floating-result" role="status" aria-label={state.message}>
-        <span className="floating-result-mark">✓</span>
-        <button className="floating-action floating-dismiss" onClick={() => sendCommand("dismiss")} aria-label="关闭提示" title="关闭">×</button>
-      </section>
-    </main>;
-  }
-
-  return <main className="overlay-root" title={state.message}>
-    <section className="floating-overlay floating-error" role="alert" aria-label={state.message}>
-      <span className="floating-result-mark error">×</span>
-      <button className="floating-action floating-dismiss" onClick={() => sendCommand("dismiss")} aria-label="关闭错误提示" title="关闭">×</button>
-    </section>
-  </main>;
+  return <OverlayView state={{ ...state, copyFeedback }} onCommand={sendCommand} />;
 }
 
 export default function App() {
+  if (import.meta.env.DEV && !hasTauriRuntime() && new URLSearchParams(window.location.search).has("overlayPreview")) return <OverlayPreview />;
   return currentWindowLabel() === "overlay" ? <OverlayApp /> : <MainApp />;
 }

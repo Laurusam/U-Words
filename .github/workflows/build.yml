@@ -30,6 +30,11 @@ jobs:
       - name: Install CMake
         uses: lukka/get-cmake@latest
       - run: npm ci
+      - run: npm test
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
       - name: Build Tauri bundle (macOS)
         if: matrix.os == 'macos-14'
         env:

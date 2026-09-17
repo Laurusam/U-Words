@@ -3,8 +3,6 @@ export type CapturedAudio = { samples: number[]; sampleRate: number };
 export type AudioCaptureOptions = {
   deviceId?: string;
   noiseSuppression?: boolean;
-  vadEnabled?: boolean;
-  autoStopSeconds?: number;
 };
 
 export class AudioCapture {
@@ -15,25 +13,17 @@ export class AudioCapture {
   private meterFrame?: number;
   private chunks: number[] = [];
   private onLevel?: (level: number) => void;
-  private onAutoStop?: () => void;
   private options: AudioCaptureOptions;
-  private startedAt = 0;
-  private lastVoiceAt = 0;
-  private autoStopTriggered = false;
   private displayedLevel = 0;
   private lastMeterFrameAt = Number.NEGATIVE_INFINITY;
 
-  constructor(onLevel?: (level: number) => void, options: AudioCaptureOptions = {}, onAutoStop?: () => void) {
+  constructor(onLevel?: (level: number) => void, options: AudioCaptureOptions = {}) {
     this.onLevel = onLevel;
     this.options = options;
-    this.onAutoStop = onAutoStop;
   }
 
   async start() {
     this.chunks = [];
-    this.startedAt = Date.now();
-    this.lastVoiceAt = this.startedAt;
-    this.autoStopTriggered = false;
     this.displayedLevel = 0;
     this.lastMeterFrameAt = Number.NEGATIVE_INFINITY;
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -49,7 +39,7 @@ export class AudioCapture {
     const source = this.context.createMediaStreamSource(this.stream);
     this.analyser = this.context.createAnalyser();
     this.analyser.fftSize = 256;
-    this.analyser.smoothingTimeConstant = 0.72;
+    this.analyser.smoothingTimeConstant = 0;
     this.processor = this.context.createScriptProcessor(1024, 1, 1);
     const silentGain = this.context.createGain();
     silentGain.gain.value = 0;
@@ -58,30 +48,20 @@ export class AudioCapture {
       for (const value of data) {
         this.chunks.push(Math.max(-1, Math.min(1, value)) * 32767);
       }
-      const now = Date.now();
-      if (this.rmsLevel(data) > 0.055) this.lastVoiceAt = now;
-      if (
-        this.options.vadEnabled &&
-        !this.autoStopTriggered &&
-        now - this.startedAt > 900 &&
-        now - this.lastVoiceAt > (this.options.autoStopSeconds ?? 2) * 1000
-      ) {
-        this.autoStopTriggered = true;
-        this.onAutoStop?.();
-      }
     };
     source.connect(this.analyser);
     this.analyser.connect(this.processor);
     this.processor.connect(silentGain);
     silentGain.connect(this.context.destination);
     await this.context.resume();
+    const meterData = new Float32Array(this.analyser.fftSize);
     const emitMeterFrame = (frameTime: number) => {
       if (!this.analyser) return;
-      if (frameTime - this.lastMeterFrameAt >= 32) {
-        const data = new Float32Array(this.analyser.fftSize);
-        this.analyser.getFloatTimeDomainData(data);
-        const level = Math.min(1, this.rmsLevel(data) * 5);
-        const alpha = level > this.displayedLevel ? 0.42 : 0.18;
+      if (frameTime - this.lastMeterFrameAt >= 14) {
+        this.analyser.getFloatTimeDomainData(meterData);
+        const level = visualAudioLevel(this.rmsLevel(meterData));
+        const delta = Number.isFinite(this.lastMeterFrameAt) ? frameTime - this.lastMeterFrameAt : 16;
+        const alpha = 1 - Math.exp(-delta / (level > this.displayedLevel ? 18 : 95));
         this.displayedLevel += (level - this.displayedLevel) * alpha;
         this.lastMeterFrameAt = frameTime;
         this.onLevel?.(this.displayedLevel);
@@ -122,6 +102,11 @@ export class AudioCapture {
     for (const value of data) sum += value * value;
     return data.length ? Math.sqrt(sum / data.length) : 0;
   }
+}
+
+export function visualAudioLevel(rms: number): number {
+  if (!Number.isFinite(rms)) return 0;
+  return Math.min(1, Math.pow(Math.max(0, rms - 0.002) * 12, 0.65));
 }
 
 export async function listAudioInputs(): Promise<MediaDeviceInfo[]> {
