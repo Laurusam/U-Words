@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for U-Words","local":true,"windows":["main","overlay"],"permissions":["core:default","core:window:allow-set-theme","global-shortcut:allow-register","global-shortcut:allow-unregister"]}}

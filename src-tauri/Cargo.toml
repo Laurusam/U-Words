@@ -1,0 +1,31 @@
+[package]
+name = "u-words"
+version = "0.5.0"
+description = "A lightweight local voice-to-text desktop app"
+authors = ["U-Words"]
+edition = "2021"
+rust-version = "1.88"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+anyhow = "1.0"
+arboard = "3.6.1"
+dirs = "6.0.0"
+enigo = "0.6.1"
+keyring = "4.2.0"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.6.3", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-global-shortcut = "2.3.0"
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+whisper-rs = "0.16.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# AppKit identifies the frontmost app without asking for Automation access to
+# System Events. objc2 is used by AppKit's generated bindings.
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace", "NSRunningApplication"] }
