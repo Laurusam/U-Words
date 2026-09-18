@@ -4,8 +4,17 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
-import { AudioCapture, listAudioInputs } from "./lib/audio";
+import { createCapture, audioInputs as listAudioInputs } from "./lib/nativeAudio";
+import type { Capture } from "./lib/nativeAudio";
 import { native } from "./lib/native";
+import { invoke } from "@tauri-apps/api/core";
+import { toolsApi } from "./lib/contextTools";
+import type { SelectionSnapshot } from "./lib/contextTools";
+import { useContextTools } from "./lib/useContextTools";
+import { ContextTools } from "./components/ContextTools";
+import { ToolsSettings } from "./components/ToolsSettings";
+import { Onboarding } from "./components/Onboarding";
+import { migrateStorage, persist } from "./lib/persistence";
 import { finalizeDictationText } from "./lib/textOutput";
 import { RecordingTrigger, replaceShortcuts } from "./lib/recordingTrigger";
 import { previousContext } from "./lib/continuity";
@@ -33,6 +42,7 @@ import type {
   OperationMode,
   PromptPresetId,
   TextStats,
+  TranscriptionResult,
   UsageStats,
   ViewName,
 } from "./types";
@@ -304,12 +314,51 @@ function MainApp() {
   const [profileApp, setProfileApp] = useState("");
   const [profilePreset, setProfilePreset] = useState<PromptPresetId>("chat");
   const isTauriRuntime = hasTauriRuntime();
+  const voiceQuestionRef = useRef<string | null>(null);
+  const voiceModeLabelRef = useRef("");
+  const toolsEscapeRef = useRef("");
+  useContextTools({
+    enabled: isTauriRuntime,
+    hotkeys: [config.hotkey, config.editHotkey],
+    busy: () => recordingRef.current || pipelineBusyRef.current || selectionBusyRef.current,
+    error: (message) => setStatusMessage(message),
+    voice: (id, action) => {
+      voiceQuestionRef.current = id;
+      voiceModeLabelRef.current =
+        action === "translate" ? "翻译" : action === "edit" || action === "polish" ? "编辑选区" : "提问";
+      void startRecording("dictate");
+    },
+    action: async (action) => {
+      if (action === "dictate") {
+        startDictateRef.current();
+        return;
+      }
+      if (action === "image" || action === "ocr") {
+        await toolsApi.screenshot(action);
+        return;
+      }
+      if (action === "copy") {
+        const text = renderedText || historyRef.current[0]?.renderedText;
+        if (text) await native.copyText(text);
+        return;
+      }
+      if (action === "dictionary") {
+        const selection = await toolsApi.selection();
+        if (!selection || selection.text.length > 100) {
+          throw new Error("请选择 100 字以内的词或短语");
+        }
+        addWord(selection.text);
+        return;
+      }
+      await toolsApi.open(action);
+    },
+  });
 
   useEffect(() => {
     document.documentElement.dataset.theme = config.theme;
     if (isTauriRuntime) void getCurrentWindow().setTheme(config.theme).catch(() => undefined);
   }, [config.theme, isTauriRuntime]);
-  const captureRef = useRef<AudioCapture | null>(null);
+  const captureRef = useRef<Capture | null>(null);
   const recordingRef = useRef(false);
   const pipelineBusyRef = useRef(false);
   const cancelRequestedRef = useRef(false);
@@ -319,6 +368,7 @@ function MainApp() {
   const escapeRegistrationRef = useRef(0);
   const operationRef = useRef<OperationMode>("dictate");
   const selectedTextRef = useRef("");
+  const selectedSnapshotRef = useRef<SelectionSnapshot | null>(null);
   const activeAppRef = useRef("");
   const historyRef = useRef(history);
   const usageStatsRef = useRef(usageStats);
@@ -367,9 +417,19 @@ function MainApp() {
     escapeRegistrationRef.current = requestId;
     try {
       await register(ESCAPE_HOTKEY, (event) => {
-        if (event.state === "Pressed") cancelCurrentRef.current();
+        if (event.state === "Pressed") {
+          if (toolsEscapeRef.current) {
+            if (toolsEscapeRef.current === "result") void toolsApi.close();
+            else void toolsApi.hide("radial");
+            toolsEscapeRef.current = "";
+          }
+          cancelCurrentRef.current();
+        }
       });
-      if (escapeRegistrationRef.current !== requestId || (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current)) {
+      if (
+        escapeRegistrationRef.current !== requestId ||
+        (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current && !toolsEscapeRef.current)
+      ) {
         await unregister(ESCAPE_HOTKEY).catch(() => undefined);
         return;
       }
@@ -392,6 +452,9 @@ function MainApp() {
     setHistory(next);
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+      if (isTauriRuntime) {
+        void persist("history", next).catch((error) => setStatusMessage("历史数据库保存失败：" + String(error)));
+      }
     } catch {
       if (notifyOnError) setStatusMessage("历史记录存储空间不足，已保留当前会话结果");
     }
@@ -413,6 +476,9 @@ function MainApp() {
     setUsageStats(next);
     try {
       localStorage.setItem(USAGE_STATS_KEY, JSON.stringify(next));
+      if (isTauriRuntime) {
+        void persist("usage", next).catch((error) => setStatusMessage("统计数据库保存失败：" + String(error)));
+      }
     } catch {
       if (notifyOnError) setStatusMessage("累计统计保存失败，但本次文字仍已完成");
     }
@@ -488,14 +554,7 @@ function MainApp() {
     if (patch.historyRetention !== undefined) storeHistory(historyRef.current, next.historyRetention);
   };
 
-  const resolvePreset = (appName: string) => {
-    const normalized = normalizeAppName(appName);
-    const profile = config.appProfiles.find((item) => {
-      const candidate = normalizeAppName(item.appName);
-      return candidate && (normalized === candidate || normalized.includes(candidate) || candidate.includes(normalized));
-    });
-    return profile?.preset || config.defaultPreset;
-  };
+  const resolvePreset = (_appName: string) => config.defaultPreset;
 
   const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "", fromHold = false) => {
     if (recordingRef.current || pipelineBusyRef.current || (selectionBusyRef.current && nextOperation === "dictate")) return;
@@ -515,7 +574,7 @@ function MainApp() {
       pendingPreviousRef.current = nextOperation === "dictate" && config.mode === "smart" && inputTargetRef.current.editable
         ? previousContext(previousDictationRef.current, inputTargetRef.current.targetKey, "", Date.now(), config.linkPreviousDictation) : undefined;
       if (!pendingPreviousRef.current) previousDictationRef.current = null;
-      const capture = new AudioCapture(
+      const capture = createCapture(
         setLevel,
         {
           deviceId: config.selectedMicId,
@@ -572,7 +631,8 @@ function MainApp() {
         return;
       }
       setStatusMessage("正在读取当前选区…");
-      const selected = await native.getSelectedText();
+      selectedSnapshotRef.current = await toolsApi.selection().catch(() => null);
+      const selected = selectedSnapshotRef.current?.text || (await native.getSelectedText());
       if (!selected.trim()) {
         setStatus("error");
         setStatusMessage("没有读取到选中文字：请先在目标应用中选中文本，再按编辑快捷键");
@@ -620,7 +680,7 @@ function MainApp() {
         hideFloatingOverlay();
         return;
       }
-      if (audio.samples.length < 1600) {
+      if ((audio.sampleCount ?? audio.samples.length) < audio.sampleRate * 0.1) {
         setStatus("idle");
         setStatusMessage("这段录音太短了");
         hideFloatingOverlay();
@@ -630,14 +690,21 @@ function MainApp() {
       setStatusMessage(config.asrProvider === "qwen" ? "千问云端正在识别…" : "本地 Whisper 正在识别…");
       const transcribeStartedAt = Date.now();
       const transcribeStartedPerf = performance.now();
-      const transcription = await native.transcribe({
-        samples: audio.samples,
-        sampleRate: audio.sampleRate,
-        language: config.language,
-        dictionary: config.dictionary,
-        model: config.activeModel,
-        quality: config.recognitionQuality,
-      });
+      const transcription = audio.recordingId
+        ? await invoke<TranscriptionResult>("transcribe_recording", {
+            id: audio.recordingId,
+            language: config.language,
+            dictionary: config.dictionary,
+            model: config.activeModel,
+          })
+        : await native.transcribe({
+            samples: audio.samples,
+            sampleRate: audio.sampleRate,
+            language: config.language,
+            dictionary: config.dictionary,
+            model: config.activeModel,
+            quality: config.recognitionQuality,
+          });
       const transcript = transcription.text;
       const transcribedAt = Date.now();
       const asrMs = Math.round(performance.now() - transcribeStartedPerf);
@@ -646,6 +713,14 @@ function MainApp() {
         return;
       }
       setRawText(transcript);
+      if (voiceQuestionRef.current) {
+        const id = voiceQuestionRef.current;
+        voiceQuestionRef.current = null;
+        await invoke("tools_question", { id, question: transcript });
+        setStatus("ready");
+        hideFloatingOverlay();
+        return;
+      }
       if (!transcript.trim()) {
         setStatus("idle");
         setStatusMessage("没有识别到清晰语音");
@@ -653,7 +728,7 @@ function MainApp() {
         return;
       }
       setStatus("rendering");
-      setStatusMessage(currentOperation === "edit" ? "正在替换选区…" : config.mode === "smart" ? "正在自动标点和整理段落…" : "正在准备文本…");
+      setStatusMessage(currentOperation === "edit" ? "正在生成编辑预览…" : config.mode === "smart" ? "正在自动标点和整理段落…" : "正在准备文本…");
       const renderStartedAt = Date.now();
       const renderStartedPerf = performance.now();
       const preset = resolvePreset(currentApp);
@@ -698,7 +773,23 @@ function MainApp() {
       let warning = [result.warning, ...transcription.warnings].filter(Boolean).join("；") || undefined;
       let insertedAt: number | undefined;
       let needsPreview = !config.autoInsert;
-      if (config.autoInsert && result.text.trim()) {
+      if (currentOperation === "edit") {
+        await invoke("tools_preview", {
+          source: currentSelectedText,
+          result: result.text,
+          selection: selectedSnapshotRef.current,
+          action: "edit",
+        });
+        needsPreview = false;
+      } else if (config.mode === "translate") {
+        await invoke("tools_preview", {
+          source: transcript,
+          result: result.text,
+          selection: null,
+          action: "translate",
+        });
+        needsPreview = false;
+      } else if (config.autoInsert && result.text.trim()) {
         if (cancelRequestedRef.current) {
           hideFloatingOverlay();
           return;
@@ -745,6 +836,7 @@ function MainApp() {
         const renderedStats = getTextStats(result.text);
         const item: HistoryItem = {
           id: String(Date.now()),
+          audioId: audio.recordingId,
           createdAt: renderedAt,
           rawText: transcript,
           canonicalText: result.canonicalText,
@@ -762,7 +854,7 @@ function MainApp() {
           timing,
           usedLlm: result.usedLlm,
         };
-        storeHistory([item, ...historyRef.current].slice(0, 100), config.historyRetention, false);
+        storeHistory([item, ...historyRef.current], config.historyRetention, false);
         recordUsage(rawStats, renderedStats, result.usedLlm, completedAt, false);
       });
       setStatus("ready");
@@ -787,6 +879,8 @@ function MainApp() {
   finishRecordingRef.current = () => void finishRecording();
 
   const cancelCurrent = async () => {
+    voiceQuestionRef.current = null;
+    if (isTauriRuntime) void invoke("cancel_processing");
     recordingTriggerRef.current.cancel();
     previousDictationRef.current = null;
     pendingPreviousRef.current = undefined;
@@ -833,6 +927,25 @@ function MainApp() {
   useEffect(() => {
     if (!isTauriRuntime) return;
     let unlisten: (() => void) | undefined;
+    let stopVoice: (() => void) | undefined;
+    let stopToolsEscape: (() => void) | undefined;
+    let disposed = false;
+    void listen<string>("tools-escape", ({ payload }) => {
+      toolsEscapeRef.current = payload;
+      if (payload) void registerEscapeShortcut();
+      else if (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current) {
+        void unregisterEscapeShortcut();
+      }
+    }).then((off) => {
+      if (disposed) off();
+      else stopToolsEscape = off;
+    });
+    void listen("tools-cancel-voice", () => {
+      if (voiceQuestionRef.current) void cancelCurrentRef.current();
+    }).then((off) => {
+      if (disposed) off();
+      else stopVoice = off;
+    });
     void listen<OverlayCommand>(OVERLAY_COMMAND_EVENT, ({ payload }) => {
       if (payload === "cancel") void cancelCurrentRef.current();
       if (payload === "finish") void finishRecordingRef.current();
@@ -842,7 +955,12 @@ function MainApp() {
         unlisten = dispose;
       })
       .catch(() => undefined);
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+      stopVoice?.();
+      stopToolsEscape?.();
+    };
   }, [isTauriRuntime]);
 
   useEffect(() => {
@@ -859,6 +977,13 @@ function MainApp() {
   useEffect(() => {
     if (!isTauriRuntime) return;
     const overlayState: OverlayState = {
+      label: voiceQuestionRef.current
+        ? voiceModeLabelRef.current
+        : operation === "edit"
+          ? "编辑选区"
+          : config.mode === "translate"
+            ? "翻译"
+            : "",
       status,
       operation,
       level,
@@ -868,12 +993,12 @@ function MainApp() {
       preview: resultPreview,
     };
     void emitTo("overlay", OVERLAY_STATE_EVENT, overlayState).catch(() => undefined);
-  }, [config.theme, isTauriRuntime, level, operation, rawText, renderedText, resultPreview, status, statusMessage]);
+  }, [config.mode, config.theme, isTauriRuntime, level, operation, rawText, renderedText, resultPreview, status, statusMessage]);
 
   useEffect(() => {
     let active = true;
     void Promise.all([native.getConfig(), native.getApiKeyStatus(), native.getModelStatus(), native.getAccessibilityStatus().catch(() => true)])
-      .then(([loadedConfig, keySet, loadedModel, trusted]) => {
+      .then(async ([loadedConfig, keySet, loadedModel, trusted]) => {
         if (!active) return;
         const nextConfig = migrateConfig(loadedConfig);
         setConfig(nextConfig);
@@ -881,7 +1006,12 @@ function MainApp() {
         setShareAsrToken(nextConfig.llmUseAsrToken || !keySet);
         setModel(loadedModel);
         setAccessibilityTrusted(trusted);
-        const nextHistory = pruneHistory(historyRef.current, nextConfig.historyRetention);
+        const savedHistory = await migrateStorage("history", historyRef.current);
+        const savedUsage = await migrateStorage("usage", usageStatsRef.current);
+        if (!active) return;
+        usageStatsRef.current = savedUsage;
+        setUsageStats(savedUsage);
+        const nextHistory = pruneHistory(savedHistory, nextConfig.historyRetention);
         historyRef.current = nextHistory;
         setHistory(nextHistory);
         localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
@@ -1087,7 +1217,7 @@ function MainApp() {
 
   const testMicrophone = async () => {
     try {
-      const capture = new AudioCapture(setLevel, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression });
+      const capture = createCapture(setLevel, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression });
       await capture.start();
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       await capture.stop();
@@ -1304,35 +1434,55 @@ function MainApp() {
           />
         )}
         {view === "settings" && (
-          <SettingsView
-            config={config}
-            model={model}
-            modelBusy={modelBusy}
-            apiKeySet={apiKeySet}
-            apiKeyInput={apiKeyInput}
-            hotkeyError={hotkeyError}
-            microphones={microphones}
-            micState={micState}
-            accessibilityTrusted={accessibilityTrusted}
-            activeApp={activeApp}
-            profileApp={profileApp}
-            profilePreset={profilePreset}
-            onConfigChange={saveConfig}
-            onProviderPreset={chooseProviderPreset}
-            onModelActivate={activateModel}
-            onHotkey={captureHotkey}
-            onApiKeyChange={setApiKeyInput}
-            onSaveApiKey={saveApiKey}
-            cloudSettings={<CloudAsrSettings config={config} tokenSet={asrTokenSet} tokenInput={asrTokenInput} busy={asrTokenBusy} shareToken={shareAsrToken} feedback={statusMessage} onConfigChange={saveConfig} onTokenChange={setAsrTokenInput} onSave={() => void saveAsrToken()} onClear={() => void clearAsrToken()} onShareChange={(value) => { setShareAsrToken(value); if (asrTokenSet) saveConfig({ llmUseAsrToken: value }); }} />}
-            onRefreshMicrophones={() => void listAudioInputs().then(setMicrophones)}
-            onTestMicrophone={testMicrophone}
-            onRefreshAccessibility={() => void refreshAccessibilityStatus()}
-            onOpenAccessibilitySettings={() => void openAccessibilitySettings()}
-            onProfileAppChange={setProfileApp}
-            onProfilePresetChange={setProfilePreset}
-            onAddProfile={addProfile}
-            onRemoveProfile={(appName) => setConfirmAction({ kind: "remove-profile", appName })}
-          />
+          <>
+            <ToolsSettings />
+            <SettingsView
+              config={config}
+              model={model}
+              modelBusy={modelBusy}
+              apiKeySet={apiKeySet}
+              apiKeyInput={apiKeyInput}
+              hotkeyError={hotkeyError}
+              microphones={microphones}
+              micState={micState}
+              accessibilityTrusted={accessibilityTrusted}
+              activeApp={activeApp}
+              profileApp={profileApp}
+              profilePreset={profilePreset}
+              onConfigChange={saveConfig}
+              onProviderPreset={chooseProviderPreset}
+              onModelActivate={activateModel}
+              onHotkey={captureHotkey}
+              onApiKeyChange={setApiKeyInput}
+              onSaveApiKey={saveApiKey}
+              cloudSettings={
+                <CloudAsrSettings
+                  config={config}
+                  tokenSet={asrTokenSet}
+                  tokenInput={asrTokenInput}
+                  busy={asrTokenBusy}
+                  shareToken={shareAsrToken}
+                  feedback={statusMessage}
+                  onConfigChange={saveConfig}
+                  onTokenChange={setAsrTokenInput}
+                  onSave={() => void saveAsrToken()}
+                  onClear={() => void clearAsrToken()}
+                  onShareChange={(value) => {
+                    setShareAsrToken(value);
+                    if (asrTokenSet) saveConfig({ llmUseAsrToken: value });
+                  }}
+                />
+              }
+              onRefreshMicrophones={() => void listAudioInputs().then(setMicrophones)}
+              onTestMicrophone={testMicrophone}
+              onRefreshAccessibility={() => void refreshAccessibilityStatus()}
+              onOpenAccessibilitySettings={() => void openAccessibilitySettings()}
+              onProfileAppChange={setProfileApp}
+              onProfilePresetChange={setProfilePreset}
+              onAddProfile={addProfile}
+              onRemoveProfile={(appName) => setConfirmAction({ kind: "remove-profile", appName })}
+            />
+          </>
         )}
       </section>
 
@@ -1347,7 +1497,30 @@ function MainApp() {
           onConfirm={confirm}
         />
       )}
-    </main>{planSession && createPortal(<PlanReviewView session={planSession} theme={config.theme} onClose={closePlanReview} onCheck={() => void checkPlan()} onCopy={copyText} onInsert={preparePlanInsertion} />, document.body)}</>
+      </main>
+      {isTauriRuntime && (
+        <Onboarding
+          config={config}
+          onConfig={saveConfig}
+          onTry={() => {
+            setView("dictate");
+          }}
+          onSettings={() => setView("settings")}
+        />
+      )}
+      {planSession &&
+        createPortal(
+          <PlanReviewView
+            session={planSession}
+            theme={config.theme}
+            onClose={closePlanReview}
+            onCheck={() => void checkPlan()}
+            onCopy={copyText}
+            onInsert={preparePlanInsertion}
+          />,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -1492,7 +1665,7 @@ function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiK
     <SettingsGroup title="历史保留" hint="历史记录默认只保存在本机，不保存原始音频。">
       <div className="setting-row"><div><strong>保留时间</strong><small>超过时间的历史会在应用启动或设置变更时清理</small></div><select value={config.historyRetention} onChange={(event) => onConfigChange({ historyRetention: event.target.value as HistoryRetention })}><option value="1">1 天</option><option value="7">7 天</option><option value="30">30 天</option><option value="forever">永久</option></select></div>
     </SettingsGroup>
-<div className="about-note"><span>◌</span><div><strong>U-Words 0.6.7</strong><p>录音双模式、阶段进度、快速音量波形与保守上下句衔接</p></div></div>
+<div className="about-note"><span>◌</span><div><strong>U-Words 0.7.0</strong><p>选区工具、长按转盘、图片提问与确认后替换</p></div></div>
   </div>;
 }
 
@@ -1597,6 +1770,12 @@ function OverlayApp() {
 }
 
 export default function App() {
-  if (import.meta.env.DEV && !hasTauriRuntime() && new URLSearchParams(window.location.search).has("overlayPreview")) return <OverlayPreview />;
+  const toolKind = currentWindowLabel();
+  if (["result", "radial", "selectionbar"].includes(toolKind)) return <ContextTools kind={toolKind} />;
+  const preview = new URLSearchParams(window.location.search).get("toolsPreview");
+  if (import.meta.env.DEV && preview) return <ContextTools kind={preview} preview />;
+  if (import.meta.env.DEV && !hasTauriRuntime() && new URLSearchParams(window.location.search).has("overlayPreview")) {
+    return <OverlayPreview />;
+  }
   return currentWindowLabel() === "overlay" ? <OverlayApp /> : <MainApp />;
 }

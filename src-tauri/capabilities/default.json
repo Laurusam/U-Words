@@ -2,10 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for U-Words",
-  "windows": ["main", "overlay"],
+  "windows": ["main", "overlay", "result", "radial", "selectionbar"],
   "permissions": [
     "core:default",
     "core:window:allow-set-theme",
+    "core:window:allow-start-dragging",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister"
   ]

@@ -14,6 +14,17 @@ const moduleText = outputText.replace('"react/jsx-runtime"', JSON.stringify(path
 const { OverlayView } = await import(await moduleUrl(new URL("../src/components/OverlayView.tsx", import.meta.url)));
 const state = { operation: "dictate", theme: "dark", level: .7, text: "", message: "识别失败" };
 
+test("dictation label is blank; other mode names appear above the capsule", () => {
+  for (const label of ["", "翻译", "编辑选区", "提问"]) {
+    const html = renderToStaticMarkup(OverlayView({ state: { ...state, status: "recording", label }, onCommand() {} }));
+    assert.match(html, new RegExp(`class="floating-mode-label"[^>]*>${label}</div>`));
+    assert.ok(html.indexOf("floating-mode-label") < html.indexOf("floating-overlay"));
+    assert.equal((html.match(/data-icon="close"/g) || []).length, 1);
+    assert.equal((html.match(/data-icon="check"/g) || []).length, 1);
+    assert.doesNotMatch(html, />转录</);
+  }
+});
+
 for (const status of ["recording", "transcribing", "rendering", "ready", "error"]) {
   test(`${status}: exactly one close/cancel symbol`, () => {
     const html = renderToStaticMarkup(OverlayView({ state: { ...state, status }, onCommand() {} }));

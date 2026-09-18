@@ -24,6 +24,7 @@ export const OVERLAY_STATE_EVENT = "u-words-overlay-state";
 export const OVERLAY_COMMAND_EVENT = "u-words-overlay-command";
 
 export type OverlayState = {
+  label?: string;
   status: AppStatus;
   operation: OperationMode;
   level: number;
@@ -140,6 +141,7 @@ export type HistoryTiming = {
 };
 
 export type HistoryItem = {
+  audioId?: string;
   id: string;
   createdAt: number;
   rawText: string;

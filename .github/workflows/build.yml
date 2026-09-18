@@ -40,7 +40,9 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "10.15"
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
-        run: npm run tauri:build -- --target ${{ matrix.rust_target }}
+        run: |
+          npm run tauri:build -- --target ${{ matrix.rust_target }} --bundles app
+          node scripts/package-dmg.mjs ${{ matrix.rust_target }}
       - name: Build Tauri bundle (Windows)
         if: matrix.os == 'windows-latest'
         run: npm run tauri:build -- --target ${{ matrix.rust_target }}

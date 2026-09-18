@@ -6,7 +6,7 @@ import "./styles.css";
 const currentLabel = (window as Window & {
   __TAURI_INTERNALS__?: { metadata?: { currentWindow?: { label?: string } } };
 }).__TAURI_INTERNALS__?.metadata?.currentWindow?.label;
-if (currentLabel === "overlay") {
+if (["overlay", "result", "radial", "selectionbar"].includes(currentLabel || "")) {
   document.documentElement.classList.add("overlay-window");
   document.body.classList.add("overlay-window");
 }
