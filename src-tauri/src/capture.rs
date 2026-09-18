@@ -7,6 +7,30 @@ use std::fs;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
+struct CaptureRestore {
+    app: AppHandle,
+    previous: Option<Session>,
+    main_visible: bool,
+    completed: bool,
+}
+impl Drop for CaptureRestore {
+    fn drop(&mut self) {
+        if self.main_visible { if let Some(w)=self.app.get_webview_window("main"){let _=w.show();} }
+        if !self.completed {
+            if let Some(previous)=self.previous.take(){
+                if let Ok(mut guard)=self.app.state::<ToolsState>().session.lock(){
+                    // Never resurrect a session explicitly closed during capture.
+                    if guard.as_ref().map(|s|s.id.as_str())==Some(previous.id.as_str()){
+                        *guard=Some(previous.clone());
+                        let _=self.app.emit_to("result","tools-session",&previous);
+                        if let Some(w)=self.app.get_webview_window("result"){let _=w.show();}
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn normalize(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() > 16_000_000 {
         return Err("图片超过 16MB，请缩小截图区域".into());
@@ -58,15 +82,18 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
     let action = action
         .filter(|action| action == "ocr")
         .unwrap_or_else(|| "image".into());
-    // Create a local draft first so denied/cancelled capture still leaves import options.
-    let session = context_tools::open_result(
+    let previous=app.state::<ToolsState>().session.lock().map_err(|_|"会话繁忙")?.clone()
+        .filter(|s|!s.busy&&s.image.is_some());
+    let mut restore=CaptureRestore{app:app.clone(),previous:previous.clone(),main_visible:app.get_webview_window("main").and_then(|w|w.is_visible().ok()).unwrap_or(false),completed:false};
+    // Re-capture is transactional: keep the old image until a replacement is ready.
+    let session = if let Some(previous)=previous {previous} else {context_tools::open_result(
         &app,
         &action,
         None,
         String::new(),
         String::new(),
         None,
-    )?;
+    )?};
     for label in ["main", "radial", "selectionbar", "result", "overlay"] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.hide();
@@ -80,6 +107,7 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
     let status = match tokio::process::Command::new("/usr/sbin/screencapture")
         .args(["-i", "-x", "-t", "png"])
         .arg(&path)
+        .kill_on_drop(true)
         .status()
         .await
     {
@@ -98,6 +126,7 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
         match tokio::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded])
             .env("UWORDS_CAPTURE_PATH", &path)
+            .kill_on_drop(true)
             .creation_flags(0x08000000)
             .status()
             .await
@@ -133,6 +162,7 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
                 .filter(|s| s.id == session.id)
                 .ok_or("截图会话已取消")?;
             s.image = Some(data);
+            s.messages.clear();s.result.clear();s.error=None;
             s.clone()
         };
         let _ = app.emit_to("result", "tools-session", &result);
@@ -140,6 +170,7 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
             let _ = context_tools::position(&app, &window, 460., 480., None);
             let _ = window.show();
         }
+        restore.completed=true;
         Ok(result)
     }
 }

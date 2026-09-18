@@ -1,4 +1,5 @@
 use crate::cloud_asr;
+use tauri::Manager;
 use crate::config::{asr_keyring_entry, get_config};
 use crate::models::{
     model_definition, model_option_for, model_path, DEFAULT_MODEL_ID, MODEL_DEFINITIONS,
@@ -124,11 +125,13 @@ fn run_whisper(
     language: &str,
     dictionary: &[String],
     model: &str,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<TranscriptCandidate, String> {
     let mut state = context
         .create_state()
         .map_err(|error| format!("创建 Whisper 状态失败：{error}"))?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    if let Some(cancel)=cancel {params.set_abort_callback_safe(move || cancel.is_cancelled());}
     params.set_n_threads(whisper_thread_count());
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -304,6 +307,7 @@ pub async fn transcribe(
     let dictionary = request.dictionary;
     let contexts = Arc::clone(&state.whisper_contexts);
     let execution_lock = Arc::clone(&state.whisper_execution_lock);
+    let cancel=app.state::<crate::recorder::RecorderState>().cancel.lock().map_err(|_|"识别任务繁忙")?.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _execution_guard = execution_lock
             .lock()
@@ -320,7 +324,7 @@ pub async fn transcribe(
         }
         for (index, (id, path)) in paths.iter().enumerate() {
             let result = cached_whisper_context(&contexts, path)
-                .and_then(|context| run_whisper(&context, &audio, &language, &dictionary, id));
+                .and_then(|context| run_whisper(&context, &audio, &language, &dictionary, id,cancel.clone()));
             match result {
                 Ok(candidate) => candidates.push(candidate),
                 Err(error) if index == 0 => return Err(error),

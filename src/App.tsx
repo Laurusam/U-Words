@@ -489,6 +489,7 @@ function MainApp() {
     setUsageStats(EMPTY_USAGE_STATS);
     try {
       localStorage.setItem(USAGE_STATS_KEY, JSON.stringify(EMPTY_USAGE_STATS));
+      if(isTauriRuntime)void persist("usage",EMPTY_USAGE_STATS).catch(error=>setStatusMessage("统计数据库重置失败："+String(error)));
     } catch {
       // The in-memory state is still reset for this session.
     }
