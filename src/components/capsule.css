@@ -1,0 +1,150 @@
+/* CapsuleStage：胶囊壳唯一渲染处。壳的宽/高/圆角与变换由 spring.ts 直接写内联 style，React 不接管这些值；
+   此处只负责静态外观（半透明底、模糊、描边）与 face 层的 crossfade/沉降动效。 */
+
+.capsule-shell {
+  box-sizing: border-box;
+  position: relative;
+  width: 164px;
+  height: 40px;
+  border: 1px solid var(--ov-line);
+  border-radius: 999px;
+  background: var(--ov-bg);
+  backdrop-filter: blur(18px) saturate(130%);
+  -webkit-backdrop-filter: blur(18px) saturate(130%);
+  color: var(--text);
+  overflow: hidden;
+  opacity: 0; /* 首帧防白底：出场动画（idle → 首个 stage）负责写入 opacity */
+  will-change: transform, opacity;
+  user-select: none;
+}
+
+.capsule-shell--idle { display: none; }
+
+/* 同一壳形态内的 stage 切换：旧 face 层淡出、新 face 层淡入（200ms） */
+.capsule-face-layer { position: absolute; inset: 0; }
+
+.capsule-face {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 5px;
+  animation: capsule-face-in .2s ease;
+}
+
+.capsule-face--card { display: flex; flex-direction: column; gap: 8px; padding: 13px; }
+
+.capsule-face--leaving { animation: capsule-face-out .2s ease forwards; pointer-events: none; }
+
+@keyframes capsule-face-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes capsule-face-out { from { opacity: 1; } to { opacity: 0; } }
+
+/* F1 → F2 切换时，旧录音层的 13 根 bar 逐根沉降（stagger 12ms，方案动效时序表） */
+.capsule-face--leaving .floating-meter i {
+  animation: capsule-bar-sink .2s ease forwards;
+  animation-delay: calc(var(--bar-i, 0) * 12ms);
+}
+
+@keyframes capsule-bar-sink { to { transform: scaleY(.14); opacity: .45; } }
+
+/* F2 处理态：脉冲点 + 阶段文本 */
+.capsule-process {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.capsule-pulse {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: capsule-pulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes capsule-pulse { from { transform: scale(.72); opacity: .55; } to { transform: scale(1.15); opacity: 1; } }
+
+/* 文本卡头部/底部行 */
+.capsule-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.capsule-card-foot { display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+/* F3 结果窗：头部工具位（⌄ 展开 + × 关闭）、来源 meta、黑白灰原文对照 diff */
+.capsule-card-tools { display: flex; align-items: center; gap: 2px; }
+.capsule-result-meta { flex: 1; min-width: 0; color: var(--text-dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.capsule-expand { color: var(--text-dim); background: rgb(var(--accent-rgb) / .06); border: 1px solid rgb(var(--accent-rgb) / .11); }
+.capsule-expand svg { transition: transform .2s ease; }
+.capsule-expand[aria-expanded="true"] svg { transform: rotate(180deg); }
+
+.capsule-result-diff {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 118px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-soft);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--ov-line);
+  user-select: text;
+}
+
+/* 删除 = 淡化 + 删除线；新增 = 前景强调 + 底部细线（box-shadow 避免行内布局抖动） */
+.capsule-diff-del { color: var(--text-dim); opacity: .62; text-decoration: line-through; }
+.capsule-diff-add { color: var(--text); font-weight: 600; box-shadow: 0 1px 0 currentColor; }
+
+/* F3 失败态：错误原因以 role=alert 展示，替代正文/对照，不提供复制按钮 */
+.capsule-result-error {
+  flex: 0 1 auto;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-soft);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgb(var(--recording-rgb) / .1);
+  border-left: 2px solid var(--recording);
+  user-select: text;
+}
+
+/* F4 图片解析窗：扫描画布 + 识别中占位行（与文本区同槽位，卡高固定不二次形变） */
+.capsule-image-canvas {
+  display: block;
+  width: 100%;
+  height: 190px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  background: rgb(128 128 128 / 8%);
+}
+.capsule-image-process {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capsule-face, .capsule-face--leaving { animation-duration: .01s; }
+  .capsule-face--leaving .floating-meter i { animation-duration: .01s; animation-delay: 0s !important; }
+  .capsule-pulse { animation: none; }
+  .capsule-expand svg { transition: none; }
+  .capsule-image-canvas { background: rgb(128 128 128 / 8%); }
+}

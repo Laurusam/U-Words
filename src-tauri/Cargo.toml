@@ -1,6 +1,6 @@
 [package]
 name = "u-words"
-version = "0.7.0"
+version = "0.8.0"
 description = "A lightweight local voice-to-text desktop app"
 authors = ["U-Words"]
 edition = "2021"

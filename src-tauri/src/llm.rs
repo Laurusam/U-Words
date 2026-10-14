@@ -332,7 +332,7 @@ pub async fn render(
     let credential = if config.llm_use_asr_token {
         // A shared ASR credential is only sent to our fixed Alibaba endpoint.
         request.base_url = cloud_asr::base_url(&config.asr_region)?.into();
-        request.model = "qwen-plus".into();
+        request.model = crate::config::QWEN_TEXT_MODEL.into();
         request.provider = "千问百炼".into();
         asr_keyring_entry(&config.asr_region)?
     } else {
@@ -402,7 +402,7 @@ pub async fn review_plan(
     let (base_url, model, provider, credential) = if config.llm_use_asr_token {
         (
             cloud_asr::base_url(&config.asr_region)?.to_string(),
-            "qwen-plus".into(),
+            crate::config::QWEN_TEXT_MODEL.into(),
             "千问百炼".into(),
             asr_keyring_entry(&config.asr_region)?,
         )

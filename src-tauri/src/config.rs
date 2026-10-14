@@ -7,6 +7,13 @@ use tauri::{AppHandle, Manager};
 
 pub const APP_ID: &str = "com.personal.whisperdesk";
 
+// 千问旗舰模型由应用内置并跟随官方最新一代，用户只需配置 API Key，不需要自行选择模型。
+// 官方推荐 qwen3.8-max：迄今能力最强的旗舰，文本与视觉理解一体（1M 上下文）。
+// 官方发布新一代旗舰时，只需更新这两个常量。
+pub const QWEN_TEXT_MODEL: &str = "qwen3.8-max";
+pub const QWEN_VISION_MODEL: &str = "qwen3.8-max";
+pub const QWEN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -56,9 +63,9 @@ impl Default for AppConfig {
             language: "auto".into(),
             mode: "smart".into(),
             translation_target: "中文".into(),
-            llm_provider: "DeepSeek".into(),
-            llm_base_url: "https://api.deepseek.com/v1".into(),
-            llm_model: "deepseek-chat".into(),
+            llm_provider: "千问百炼".into(),
+            llm_base_url: QWEN_BASE_URL.into(),
+            llm_model: QWEN_TEXT_MODEL.into(),
             llm_temperature: 0.2,
             dictionary: Vec::new(),
             auto_insert: true,

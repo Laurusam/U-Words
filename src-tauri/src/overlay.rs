@@ -7,13 +7,27 @@ fn position_overlay<R: Runtime>(
     monitor: &tauri::Monitor,
     expanded: bool,
 ) -> Result<(), String> {
-    let work_area = monitor.work_area();
-    let size = tauri::LogicalSize::new(
+    position_overlay_sized(
+        window,
+        monitor,
         if expanded { 342.0 } else { 166.0 },
         if expanded { 222.0 } else { 66.0 },
-    );
+        if expanded { 48.0 } else { 24.0 },
+    )
+}
+
+/// bottom-center 定位 + set_size 一步到位；胶囊形态切换（F1/F2 → 文本/图片卡）共用。
+fn position_overlay_sized<R: Runtime>(
+    window: &WebviewWindow<R>,
+    monitor: &tauri::Monitor,
+    width: f64,
+    height: f64,
+    gap_points: f64,
+) -> Result<(), String> {
+    let work_area = monitor.work_area();
+    let size = tauri::LogicalSize::new(width, height);
     let physical: tauri::PhysicalSize<u32> = size.to_physical(monitor.scale_factor());
-    let gap = ((if expanded { 48.0 } else { 24.0 }) * monitor.scale_factor()).round() as u32;
+    let gap = (gap_points * monitor.scale_factor()).round() as u32;
     let (x, y) = overlay_layout::bottom_center(
         overlay_layout::Rect {
             x: monitor.position().x,
@@ -53,6 +67,8 @@ pub fn show_overlay(
     app: AppHandle,
     state: State<'_, AppState>,
     expanded: Option<bool>,
+    width: Option<f64>,
+    height: Option<f64>,
 ) -> Result<(), String> {
     let window = app
         .get_webview_window("overlay")
@@ -93,7 +109,11 @@ pub fn show_overlay(
         .ok_or_else(|| "未检测到可用显示器".to_string())?;
     *anchor = Some(monitor.clone());
     drop(anchor);
-    position_overlay(&window, &monitor, expanded)?;
+    // 显式尺寸（F4 图片解析窗等自定义卡片）优先于两档预设形态
+    match (width, height) {
+        (Some(w), Some(h)) => position_overlay_sized(&window, &monitor, w, h, 24.0)?,
+        _ => position_overlay(&window, &monitor, expanded)?,
+    }
     window
         .show()
         .map_err(|error| format!("显示悬浮窗失败：{error}"))
@@ -113,4 +133,31 @@ pub fn hide_window(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "主窗口不存在".to_string())?
         .hide()
         .map_err(|error| format!("隐藏窗口失败：{error}"))
+}
+
+/// 胶囊形态切换时按新尺寸重排：沿用 stored anchor 所在屏幕，bottom-center 重定位 + set_size 一步到位。
+/// 窗口尺寸立即到位，壳动画由前端 spring 接管（CapsuleStage）。
+#[tauri::command]
+pub fn resize_overlay(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let window = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "悬浮窗不存在".to_string())?;
+    let anchor = state
+        .overlay_monitor
+        .lock()
+        .map_err(|_| "浮窗屏幕状态不可用".to_string())?;
+    let monitor = match anchor.as_ref() {
+        Some(current) => current.clone(),
+        None => app
+            .primary_monitor()
+            .map_err(|error| format!("读取显示器失败：{error}"))?
+            .ok_or_else(|| "未检测到可用显示器".to_string())?,
+    };
+    drop(anchor);
+    position_overlay_sized(&window, &monitor, width, height, 24.0)
 }

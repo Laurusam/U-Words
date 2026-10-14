@@ -157,6 +157,10 @@ fn send_copy_shortcut() -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_selected_text() -> Result<String, String> {
+    // 焦点在自身时绝不模拟 Cmd+C：自家选区不进剪贴板哨兵链路（语义同 selection mac 分支）
+    if input_target::focus_is_self() {
+        return Ok(String::new());
+    }
     let mut clipboard = Clipboard::new().map_err(|error| format!("初始化剪贴板失败：{error}"))?;
     let previous = clipboard.get_text().ok();
     let previous_image = if previous.is_none() {

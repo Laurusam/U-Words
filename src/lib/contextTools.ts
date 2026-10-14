@@ -72,7 +72,6 @@ export type ToolSession = {
   selection: SelectionSnapshot | null;
   busy: boolean;
   error: string | null;
-  theme: "dark" | "light";
   messages: unknown[];
 };
 

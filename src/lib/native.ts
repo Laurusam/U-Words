@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createWriteQueue } from "./writeQueue";
+import type { SelectionSnapshot } from "./contextTools";
 import type { AppConfig, InputTarget, ModelStatus, PlanReview, RenderResult, TranscriptCandidate, TranscriptionResult } from "../types";
 
 export type TranscribeRequest = {
@@ -52,7 +53,12 @@ export const native = {
   getAccessibilityStatus: () => invoke<boolean>("get_accessibility_status"),
   openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
   setLaunchAtLogin: (enabled: boolean) => invoke<void>("set_launch_at_login", { enabled }),
-  showOverlay: (expanded = false) => invoke<void>("show_overlay", { expanded }),
+  showOverlay: (expanded = false, size?: { width: number; height: number }) =>
+    invoke<void>("show_overlay", { expanded, width: size?.width ?? null, height: size?.height ?? null }),
   hideOverlay: () => invoke<void>("hide_overlay"),
+  resizeOverlay: (width: number, height: number) => invoke<void>("resize_overlay", { width, height }),
+  /** F3 选区编辑自动写入：校验失败即 Err，由调用方落入 [复制] 兜底 */
+  applySelection: (source: string, result: string, selection: SelectionSnapshot | null) =>
+    invoke<void>("tools_apply_selection", { source, result, selection }),
   hideWindow: () => invoke<void>("hide_window"),
 };

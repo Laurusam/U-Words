@@ -107,14 +107,13 @@ fn main() {
             selection::read_selection,
             context_tools::tools_session,
             context_tools::tools_open,
-            context_tools::tools_preview,
+            context_tools::tools_apply_selection,
             context_tools::tools_close,
             context_tools::tools_run,
             context_tools::tools_replace,
             context_tools::tools_set_source,
             context_tools::tools_show_menu,
             context_tools::tools_hide_menu,
-            context_tools::tools_question,
             capture::capture_region,
             capture::attach_image,
             capture::export_image,
@@ -144,6 +143,7 @@ fn main() {
             platform::set_launch_at_login,
             overlay::show_overlay,
             overlay::hide_overlay,
+            overlay::resize_overlay,
             overlay::hide_window
         ])
         .on_window_event(|window, event| {

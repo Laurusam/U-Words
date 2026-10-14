@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ACTIONS, DEFAULT_TOOLS, radialIndex, toolsApi } from "../lib/contextTools";
 import type { ActionId, ToolSession, ToolsConfig } from "../lib/contextTools";
+import { animateSpring, SPRING_POP } from "../lib/spring";
+import { insertTextAtFocusedEditable } from "../lib/selfInsert";
 import { native } from "../lib/native";
 import "./context-tools.css";
 
@@ -16,7 +19,6 @@ const PREVIEW_SESSION: ToolSession = {
   selection: null,
   busy: false,
   error: null,
-  theme: "dark",
   messages: [],
 };
 
@@ -30,11 +32,51 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
-  const selectedRef = useRef<number | null>(null);
   const [more, setMore] = useState(false);
+  // 真实窗口由 Rust initialization_script 注入 __UWORDS_THEME__；浏览器预览可用 ?theme=light 覆盖
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    const injected = (window as { __UWORDS_THEME__?: string }).__UWORDS_THEME__;
+    if (injected === "light" || injected === "dark") return injected;
+    return new URLSearchParams(window.location.search).get("theme") === "light" ? "light" : "dark";
+  });
+  const [previewMessage, setPreviewMessage] = useState("");
+  const [leaving, setLeaving] = useState(false);
+  const leavingRef = useRef(false);
+  const leaveTimer = useRef(0);
+  const shellRef = useRef<HTMLDivElement>(null);
+
+  // C4 退场：先播 leaving 动画，播完再 tools_hide_menu 真正隐藏窗口；幂等，动画期间不重复触发。
+  // leaving 状态保留到下次唤出时复位（tools-menu handler），避免 hide 前闪回可见一帧。
+  // 预览模式照播动画但不隐藏窗口，动画结束即复位，供反复演示。
+  const dismiss = () => {
+    if (leavingRef.current) return;
+    leavingRef.current = true;
+    setLeaving(true);
+    const duration = kind === "selectionbar" ? 140 : 160;
+    if (preview) {
+      setPreviewMessage("已取消");
+      setSelected(null);
+      leaveTimer.current = window.setTimeout(() => {
+        leavingRef.current = false;
+        setLeaving(false);
+      }, duration);
+      return;
+    }
+    leaveTimer.current = window.setTimeout(() => {
+      leavingRef.current = false;
+      void invoke("tools_hide_menu", { kind }).catch(() => undefined);
+    }, duration);
+  };
+
+  const cancelRadial = () => {
+    dismiss();
+  };
 
   const act = async (action: ActionId) => {
-    if (preview) return;
+    if (preview) {
+      setPreviewMessage(`已选择：${ACTIONS[action]}`);
+      return;
+    }
     await emitTo("main", "tools-action", action);
   };
 
@@ -77,6 +119,13 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
       if (active) stops.push(stop);
       else stop();
     };
+    if (kind === "result") {
+      // 主窗口判定焦点在自身但自己文档无可编辑元素时，可能落在结果窗输入框：
+      // 由本 webview 自己做 DOM 插入并回执，主窗口据此决定是否降级复制卡片
+      void bind<string>("tools-self-insert", (text) => {
+        void emitTo("main", "tools-self-inserted", insertTextAtFocusedEditable(text));
+      });
+    }
     void bind("tools-cleared", () => {
       setSession(null);
       setQuestion("");
@@ -101,25 +150,86 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
       });
     });
     void bind("tools-menu", () => {
-      selectedRef.current = null;
+      const shell = shellRef.current;
+      // 中断可能在途的退场（窗口复用前一次退场未结束又被唤出）
+      if (leavingRef.current) {
+        leavingRef.current = false;
+        window.clearTimeout(leaveTimer.current);
+        setLeaving(false);
+      }
+      if (shell && kind === "radial") {
+        // 重播扇形 stagger 与中心 pop（窗口复用时不会自动重播）；class 直改避免 remount 丢焦点
+        shell.classList.remove("radial-shell--play");
+        void shell.offsetWidth;
+        shell.classList.add("radial-shell--play");
+        // 入场 spring：scale .7→1 直写 transform（动画优先级高于 inline，退场 forwards 可正常覆盖）
+        animateSpring({
+          from: .7,
+          to: 1,
+          config: SPRING_POP,
+          onUpdate: (value) => {
+            if (shell.isConnected) shell.style.transform = `scale(${value.toFixed(4)})`;
+          },
+        });
+        // 转盘唤出后接管键盘焦点：Esc 立即生效，点击外部导致的失焦负责关闭转盘
+        void getCurrentWindow().setFocus();
+        shell.focus({ preventScroll: true });
+      } else if (shell && kind === "selectionbar") {
+        shell.classList.remove("selection-toolbar--play");
+        void shell.offsetWidth;
+        shell.classList.add("selection-toolbar--play");
+      }
       setSelected(null);
       setMore(false);
       void toolsApi.config().then(setConfig);
     });
-    void bind("tools-radial-release", () => {
-      const index = selectedRef.current;
-      void toolsApi.hide("radial");
-      if (index !== null) void toolsApi.config().then((config) => act(config.items[index]));
-    });
+    // 主窗口发起的退场（选择动作/失焦/poll 收起）：播完动画后由 dismiss 计时器真正 hide
+    void bind("tools-menu-dismiss", () => dismiss());
+    void bind<"dark" | "light">("tools-theme", setTheme);
     return () => {
       active = false;
+      window.clearTimeout(leaveTimer.current);
       stops.forEach((stop) => stop());
     };
   }, [kind, preview]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = session?.theme || "dark";
-  }, [session?.theme]);
+    if (preview || kind !== "radial") return;
+    let active = true;
+    let stopFocus: (() => void) | undefined;
+    void getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        // 点击转盘外部或切换应用都会失焦，此时关闭转盘
+        if (!focused && active) dismiss();
+      })
+      .then((off) => {
+        if (active) stopFocus = off;
+        else off();
+      });
+    return () => {
+      active = false;
+      stopFocus?.();
+    };
+  }, [kind, preview]);
+
+  useEffect(() => {
+    if (!preview || kind !== "radial") return;
+    // 预览模式下模拟“点击外部取消”的行为反馈
+    const handler = (event: MouseEvent) => {
+      const shell = shellRef.current;
+      if (shell && event.target instanceof Node && !shell.contains(event.target)) {
+        setPreviewMessage("已取消");
+        setSelected(null);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [kind, preview]);
+
+  // 用 layout effect 在首帧绘制前落地主题属性，避免浅色用户看到一帧深色
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -130,7 +240,7 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
         return;
       }
       if (kind === "result") close();
-      else void toolsApi.hide(kind);
+      else dismiss();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -139,20 +249,18 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
   if (kind === "radial") {
     return (
       <div
-        className="radial-shell"
+        ref={shellRef}
+        className={`radial-shell radial-shell--play${leaving ? " radial-shell--leaving" : ""}`}
+        tabIndex={-1}
         onMouseMove={(event) => {
           const rect = event.currentTarget.getBoundingClientRect();
           const index = radialIndex(event.clientX - rect.left, event.clientY - rect.top, config.items.length);
-          selectedRef.current = index;
-          setSelected(index);
+          if (index !== selected) setSelected(index);
         }}
-        onMouseLeave={() => {
-          selectedRef.current = null;
-          setSelected(null);
-        }}
+        onMouseLeave={() => setSelected(null)}
       >
-        <svg viewBox="0 0 300 300" className="radial-svg">
-          <circle cx="150" cy="150" r="145" />
+        <div className="radial-glass" aria-hidden="true" />
+        <svg viewBox="0 0 300 300" className="radial-svg" aria-label="快捷功能转盘">
           {config.items.map((item, index) => {
             const count = config.items.length;
             const angle = (index * 2 * Math.PI) / count - Math.PI / 2;
@@ -160,7 +268,7 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
             const end = angle + Math.PI / count;
             const point = (radius: number, theta: number) => `${150 + radius * Math.cos(theta)},${150 + radius * Math.sin(theta)}`;
             return (
-              <g key={`${item}-${index}`} onClick={() => void act(item)}>
+              <g key={`${item}-${index}`} role="button" tabIndex={0} aria-label={ACTIONS[item]} onFocus={()=>setSelected(index)} onKeyDown={e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();void act(item);}}} onClick={() => void act(item)} style={{ "--piece-i": index } as CSSProperties}>
                 <path
                   className={selected === index ? "active" : ""}
                   d={`M ${point(44, start)} L ${point(144, start)} A 144 144 0 0 1 ${point(144, end)} L ${point(44, end)} A 44 44 0 0 0 ${point(44, start)} Z`}
@@ -177,24 +285,23 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
             );
           })}
         </svg>
-        <div className="radial-center">
-          {selected === null ? (
-            <>
-              松开取消<small>移动选择</small>
-            </>
-          ) : (
-            <>
-              松开执行<small>{ACTIONS[config.items[selected]]}</small>
-            </>
-          )}
-        </div>
+        <button className="radial-center" aria-label="取消转盘" onClick={cancelRadial}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m7 7 10 10M17 7 7 17"/></svg>
+          <span>取消</span>
+        </button>
+        {preview && (
+          <div className="radial-preview-controls">
+            <button onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}>切换主题</button>
+            <span role="status">{previewMessage || "松开快捷键后保持显示，点击选择，点击外部取消"}</span>
+          </div>
+        )}
       </div>
     );
   }
 
   if (kind === "selectionbar") {
     return (
-      <div className="selection-toolbar">
+      <div ref={shellRef} className={`selection-toolbar selection-toolbar--play${leaving ? " selection-toolbar--leaving" : ""}`}>
         {more ? (
           <>
             <button onClick={() => void act("image")}>截图提问</button>
@@ -208,10 +315,19 @@ export function ContextTools({ kind, preview = false }: { kind: string; preview?
             <button onClick={() => void act("translate")}>翻译</button>
           </>
         )}
-        <button aria-label="更多功能" onClick={() => setMore(!more)}>
+        <button aria-label={more ? "返回基础工具" : "更多功能"} aria-expanded={more} onClick={() => setMore(!more)}>
           {more ? "返回" : "···"}
         </button>
-        <button aria-label="关闭选区工具条" onClick={() => void emitTo("main", "tools-dismiss-selection")}>
+        <button
+          aria-label="关闭选区工具条"
+          onClick={() => {
+            if (preview) {
+              dismiss();
+              return;
+            }
+            void emitTo("main", "tools-dismiss-selection");
+          }}
+        >
           ×
         </button>
       </div>

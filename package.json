@@ -1,16 +1,18 @@
 {
   "name": "u-words",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "description": "A lightweight local voice-to-text desktop app.",
   "type": "module",
   "scripts": {
-    "test": "node --test scripts/test-config-queue.mjs scripts/test-overlay.mjs scripts/test-macos-bundle.mjs scripts/test-audio.mjs scripts/test-plan-review.mjs scripts/test-languages.mjs scripts/test-text-output.mjs scripts/test-recording-flow.mjs scripts/test-context-tools.mjs",
+    "test": "node --test scripts/test-config-queue.mjs scripts/test-overlay.mjs scripts/test-diff.mjs scripts/test-waveform.mjs scripts/test-macos-bundle.mjs scripts/test-audio.mjs scripts/test-plan-review.mjs scripts/test-languages.mjs scripts/test-text-output.mjs scripts/test-recording-flow.mjs scripts/test-context-tools.mjs scripts/test-self-insert.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri:dev": "node scripts/tauri.mjs dev",
-    "tauri:build": "node scripts/tauri.mjs build"
+    "tauri:build": "node scripts/tauri.mjs build",
+    "tauri:install": "rm -rf /Applications/U-Words.app && cp -R src-tauri/target/release/bundle/macos/U-Words.app /Applications/ && codesign --verify --deep --strict /Applications/U-Words.app && echo INSTALL-OK",
+    "tauri:dmg": "node scripts/package-dmg.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

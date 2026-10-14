@@ -8,6 +8,10 @@ pub struct InputTarget {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_key: Option<String>,
+    /// 焦点在 U-Words 自身：editable 恒为 false，跨应用粘贴链路一律拒绝，
+    /// 由前端按 DOM 焦点决定原生插入（selfInsert.ts）
+    #[serde(rename = "self")]
+    pub self_target: bool,
 }
 
 fn unavailable(reason: &str) -> InputTarget {
@@ -16,7 +20,47 @@ fn unavailable(reason: &str) -> InputTarget {
         app_pid: None,
         reason: reason.into(),
         target_key: None,
+        self_target: false,
     }
+}
+
+fn self_target() -> InputTarget {
+    InputTarget {
+        editable: false,
+        app_pid: Some(std::process::id() as i32),
+        reason: "当前焦点在 U-Words，请复制后粘贴".into(),
+        target_key: None,
+        self_target: true,
+    }
+}
+
+/// 焦点是否落在 U-Words 自身进程（轻量判定：只看前台归属，不遍历 AX/UIA 树）
+#[cfg(target_os = "macos")]
+pub fn focus_is_self() -> bool {
+    macos::frontmost_pid_is_self()
+}
+
+#[cfg(target_os = "windows")]
+pub fn focus_is_self() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(window: isize, pid: *mut u32) -> u32;
+    }
+    unsafe {
+        let window = GetForegroundWindow();
+        if window == 0 {
+            return false;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        pid != 0 && pid == std::process::id()
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn focus_is_self() -> bool {
+    false
 }
 
 pub fn ensure_target(target: &InputTarget, expected_pid: Option<i32>) -> Result<(), String> {
@@ -56,6 +100,10 @@ pub fn inspect() -> InputTarget {
         }
         let mut pid = 0;
         let thread = GetWindowThreadProcessId(window, &mut pid);
+        // 自家窗口不进跨应用链路（前案 G4 判定表落实）
+        if pid != 0 && pid == std::process::id() {
+            return self_target();
+        }
         let mut info = GuiThreadInfo {
             size: std::mem::size_of::<GuiThreadInfo>() as u32,
             flags: 0,
@@ -70,6 +118,7 @@ pub fn inspect() -> InputTarget {
             app_pid: Some(pid as i32),
             reason: "检测到系统输入光标".into(),
             target_key: (info.windows[1] != 0).then(|| format!("{pid}:{}", info.windows[1])),
+            self_target: false,
         }
     }
 }
@@ -153,7 +202,26 @@ mod macos {
             )
         }
     }
+    pub fn frontmost_pid_is_self() -> bool {
+        // webview 内容经宿主进程暴露 AX，前台应用 pid 即主进程 pid；
+        // AX 读不到焦点元素时此兜底也能把自家归类为“自己”
+        unsafe {
+            let system = Owned(AXUIElementCreateSystemWide());
+            if system.0.is_null() {
+                return false;
+            }
+            let Some(app) = attribute(system.0, "AXFocusedApplication") else {
+                return false;
+            };
+            let mut pid = 0;
+            AXUIElementGetPid(app.0, &mut pid) == 0 && pid == std::process::id() as i32
+        }
+    }
     pub fn inspect() -> InputTarget {
+        // 自家窗口不进跨应用 AX 链路，交给前端按 DOM 焦点决定插入方式
+        if frontmost_pid_is_self() {
+            return self_target();
+        }
         unsafe {
             if AXIsProcessTrusted() == 0 {
                 return unavailable("辅助功能未授权，文字已保留，请复制文字");
@@ -191,7 +259,8 @@ mod macos {
                 return unavailable("无法确认目标应用，请复制文字");
             }
             if pid == std::process::id() as i32 {
-                return unavailable("当前焦点在 U-Words，请复制到目标应用");
+                // 竞态兜底：判定中途焦点切回自身，同样归类为“自己”
+                return self_target();
             }
             InputTarget {
                 editable: true,
@@ -200,6 +269,7 @@ mod macos {
                 // Metadata-only best-effort identity, not proof the document is unchanged.
                 target_key: attribute(focus.0, "AXWindow")
                     .map(|window| format!("{pid}:{}:{}", CFHash(window.0), CFHash(focus.0))),
+                self_target: false,
             }
         }
     }
@@ -216,7 +286,10 @@ mod tests {
             app_pid: Some(123),
             reason: String::new(),
             target_key: None,
+            self_target: false,
         };
+        // 自身目标 editable 恒为 false：跨应用粘贴链路对自家永远拒绝
+        assert!(ensure_target(&self_target(), None).is_err());
         assert!(ensure_target(&target, Some(123)).is_ok());
         assert!(ensure_target(&target, Some(456)).is_err());
     }

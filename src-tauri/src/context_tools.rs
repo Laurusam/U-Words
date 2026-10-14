@@ -25,7 +25,6 @@ pub struct Session {
     pub selection: Option<Selection>,
     pub busy: bool,
     pub error: Option<String>,
-    pub theme: String,
     pub messages: Vec<Value>,
 }
 
@@ -35,9 +34,8 @@ pub struct ToolsState {
     pub cancel: Mutex<Option<CancellationToken>>,
 }
 
-fn send(app: &AppHandle, session: &Session) {
-    let _ = app.emit_to("result", "tools-session", session);
-}
+// C4 result 窗退役：会话状态不再推送给永不可见的 result 窗（旧 send 每轮把含 base64 图的
+// 完整 Session 重复序列化 3+ 次）；若未来恢复该窗口，图片须走独立通道（参考主窗→overlay）。
 
 fn same_selection(current: &Selection, expected: &Selection) -> bool {
     current.pid == expected.pid
@@ -50,11 +48,19 @@ fn window(app: &AppHandle, label: &str, w: f64, h: f64, focusable: bool) -> Resu
     if let Some(existing) = app.get_webview_window(label) {
         return Ok(existing);
     }
+    let theme = get_config(app.clone())
+        .map(|config| config.theme)
+        .ok()
+        .filter(|theme| theme == "light" || theme == "dark")
+        .unwrap_or_else(|| "dark".to_string());
     tauri::WebviewWindowBuilder::new(
         app,
         label,
         tauri::WebviewUrl::App("index.html".into()),
     )
+    .initialization_script(format!(
+        "window.__UWORDS_THEME__={theme:?};document.documentElement.dataset.theme={theme:?};"
+    ))
     .title("U-Words")
     .inner_size(w, h)
     .decorations(false)
@@ -154,7 +160,6 @@ pub fn open_result(
         selection,
         busy: false,
         error: None,
-        theme: get_config(app.clone())?.theme,
         messages: vec![],
     };
     *guard = Some(session.clone());
@@ -165,10 +170,8 @@ pub fn open_result(
             let _ = window.hide();
         }
     }
-    let window = window(app, "result", 460., 480., true)?;
-    position(app, &window, 460., 480., session.selection.as_ref())?;
-    window.show().map_err(|error| error.to_string())?;
-    send(app, &session);
+    // C4 result 窗退役：工具结果统一由 overlay（F3/F4）承载，窗口保持创建仅供遗留事件投递
+    let _ = window(app, "result", 460., 480., true)?;
     Ok(session)
 }
 
@@ -191,33 +194,31 @@ pub async fn tools_open(app: AppHandle, action: String) -> Result<Session, Strin
     open_result(&app, &action, selected, source, String::new(), None)
 }
 
+/// 选区编辑自动写入（F3 结果窗）：不打开任何窗口，直接复用替换校验链
+/// （选区文本精确匹配 → 激活目标应用 → 选区仍一致 → 粘贴）。
+/// 任何一步失败都返回 Err，由前端落入 [复制] 兜底；overlay 不持有焦点（focusable:false），
+/// 激活目标应用后粘贴不受影响。
 #[tauri::command]
-pub fn tools_preview(
-    app: AppHandle,
+pub async fn tools_apply_selection(
     source: String,
     result: String,
     selection: Option<Selection>,
-    action: Option<String>,
-) -> Result<Session, String> {
-    let action = action.unwrap_or_else(|| "edit".into());
-    if !["edit", "translate"].contains(&action.as_str()) {
-        return Err("无效操作".into());
+) -> Result<(), String> {
+    let expected = selection
+        .filter(|selection| selection.text == source)
+        .ok_or("原选区无法验证，请复制结果")?;
+    if let Err(error) = selection::activate(expected.pid) {
+        return Err(error);
     }
-    let selection = selection.filter(|selection| selection.text == source);
-    open_result(&app, &action, selection, source, result, None)
-}
-
-#[tauri::command]
-pub fn tools_question(app: AppHandle, id: String, question: String) -> Result<(), String> {
-    let state = app.state::<ToolsState>();
-    let mut guard = state.session.lock().map_err(|_| "任务繁忙")?;
-    let session = guard
-        .as_mut()
-        .filter(|session| session.id == id && !session.busy)
-        .ok_or("会话已关闭")?;
-    session.question = question;
-    send(&app, session);
-    Ok(())
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let current = tauri::async_runtime::spawn_blocking(selection::read)
+        .await
+        .ok()
+        .flatten();
+    if !current.is_some_and(|current| same_selection(&current, &expected)) {
+        return Err("原选区已变化或失去焦点，请复制结果".into());
+    }
+    paste_text(result, Some(expected.pid))
 }
 
 #[tauri::command]
@@ -240,6 +241,7 @@ pub fn tools_show_menu(
 
 #[tauri::command]
 pub fn tools_hide_menu(app: AppHandle, kind: String) {
+    if kind=="radial" { let _=app.emit_to("main","tools-radial-closed",()); }
     if ["radial", "selectionbar"].contains(&kind.as_str()) {
         if let Some(window) = app.get_webview_window(&kind) {
             let _ = window.hide();
@@ -253,11 +255,10 @@ fn model_config(app: &AppHandle, vision: bool) -> Result<(String, String, String
         let key = asr_keyring_entry(&config.asr_region)?
             .get_password()
             .map_err(|_| "请配置百炼 Token")?;
-        // Explicit visual model configuration, never assume a text model supports images.
         let model = if vision {
-            read_visual_model(app)?
+            read_visual_model(app)
         } else {
-            "qwen-plus".into()
+            crate::config::QWEN_TEXT_MODEL.into()
         };
         Ok((
             cloud_asr::base_url(&config.asr_region)?.into(),
@@ -269,7 +270,7 @@ fn model_config(app: &AppHandle, vision: bool) -> Result<(String, String, String
             .get_password()
             .map_err(|_| "请配置文字模型 API Key")?;
         let model = if vision {
-            read_visual_model(app)?
+            read_visual_model(app)
         } else {
             config.llm_model
         };
@@ -277,15 +278,18 @@ fn model_config(app: &AppHandle, vision: bool) -> Result<(String, String, String
     }
 }
 
-fn read_visual_model(app: &AppHandle) -> Result<String, String> {
-    let value = storage::storage_read(app.state::<Store>(), "tools".into())?
+// 视觉模型同样内置官方最新最强版本：用户无需配置；此前在设置里填过自定义值的仍优先生效。
+fn read_visual_model(app: &AppHandle) -> String {
+    let value = storage::storage_read(app.state::<Store>(), "tools".into())
+        .ok()
+        .flatten()
         .unwrap_or(Value::Null);
     value["visionModel"]
         .as_str()
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_string)
-        .ok_or("请在快捷工具设置中填写支持图片的模型名称；复用当前服务地址和 Key".into())
+        .unwrap_or_else(|| crate::config::QWEN_VISION_MODEL.into())
 }
 
 // 工具结果会被用户采纳替换原文，未知或截断的响应一律不交付：
@@ -375,10 +379,9 @@ pub async fn tools_run(app: AppHandle, id: String, question: String) -> Result<S
         if current.as_ref().map(|s|s.id.as_str()) != Some(id.as_str()) { return Err("会话已关闭".into()); }
         state.cancel.lock().map_err(|_| "任务繁忙")?.clone().ok_or("会话已关闭")?
     };
-    {
-        let current = state.session.lock().map_err(|_| "任务繁忙")?;
-        if current.as_ref().map(|s|s.id.as_str()) != Some(id.as_str()) { return Err("会话已关闭".into()); }
-        send(&app, &session);
+    // C4 result 窗退役：不再推送起扫帧，仅校验会话仍有效
+    if state.session.lock().map_err(|_| "任务繁忙")?.as_ref().map(|s|s.id.as_str()) != Some(id.as_str()) {
+        return Err("会话已关闭".into());
     }
     let work = async {
         if session.source.chars().count() > 40_000 || question.chars().count() > 8_000 {
@@ -444,10 +447,9 @@ pub async fn tools_run(app: AppHandle, id: String, question: String) -> Result<S
         Err(error) => session.error = Some(error),
     }
     commit_session(&state, &id, &session)?;
-    {
-        let current = state.session.lock().map_err(|_| "任务繁忙")?;
-        if current.as_ref().map(|s|s.id.as_str()) != Some(id.as_str()) { return Err("会话已关闭".into()); }
-        send(&app, &session);
+    // C4 result 窗退役：不再推送完成帧，仅校验会话未被并发关闭
+    if state.session.lock().map_err(|_| "任务繁忙")?.as_ref().map(|s|s.id.as_str()) != Some(id.as_str()) {
+        return Err("会话已关闭".into());
     }
     // Context-tool conversations are session-only by default, including image answers.
     Ok(session)
@@ -514,7 +516,7 @@ pub fn tools_set_source(app: AppHandle, id: String, source: String) -> Result<()
     session.source = source;
     session.selection = None;
     session.messages.clear();
-    send(&app, session);
+    // C4 result 窗退役：不再向不可见窗口推送更新后的会话
     Ok(())
 }
 
@@ -569,7 +571,6 @@ mod tests {
             selection: None,
             busy: false,
             error: None,
-            theme: "dark".into(),
             messages: vec![],
         };
         let value = serde_json::to_value(session).unwrap();
@@ -588,7 +589,6 @@ mod tests {
             selection: None,
             busy: false,
             error: None,
-            theme: "dark".into(),
             messages: vec![],
         }
     }

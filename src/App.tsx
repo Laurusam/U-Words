@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
@@ -8,8 +8,8 @@ import { createCapture, audioInputs as listAudioInputs } from "./lib/nativeAudio
 import type { Capture } from "./lib/nativeAudio";
 import { native } from "./lib/native";
 import { invoke } from "@tauri-apps/api/core";
-import { toolsApi } from "./lib/contextTools";
-import type { SelectionSnapshot } from "./lib/contextTools";
+import { ACTIONS, toolsApi } from "./lib/contextTools";
+import type { ActionId, SelectionSnapshot } from "./lib/contextTools";
 import { useContextTools } from "./lib/useContextTools";
 import { ContextTools } from "./components/ContextTools";
 import { ToolsSettings } from "./components/ToolsSettings";
@@ -18,15 +18,18 @@ import { migrateStorage, persist } from "./lib/persistence";
 import { finalizeDictationText } from "./lib/textOutput";
 import { RecordingTrigger, replaceShortcuts } from "./lib/recordingTrigger";
 import { previousContext } from "./lib/continuity";
+import { insertTextAtFocusedEditable } from "./lib/selfInsert";
+import { levelBus } from "./lib/levelBus";
 import type { ContinuityEntry } from "./lib/continuity";
 import { ProcessingProgress } from "./components/ProcessingProgress";
-import { OverlayView } from "./components/OverlayView";
+import { Waveform } from "./components/Waveform";
+import { CapsuleStage, resolveStage } from "./components/CapsuleStage";
 import { OverlayPreview } from "./components/OverlayPreview";
 import { AsrLanguageSelect } from "./components/AsrLanguageSelect";
 import { PlanReviewView } from "./components/PlanReviewView";
 import type { PlanReviewSession } from "./components/PlanReviewView";
 import appIcon from "../src-tauri/icons/icon.png";
-import { OVERLAY_COMMAND_EVENT, OVERLAY_STATE_EVENT } from "./types";
+import { OVERLAY_COMMAND_EVENT, OVERLAY_IMAGE_EVENT, OVERLAY_READY_EVENT, OVERLAY_STATE_EVENT } from "./types";
 import type {
   AppConfig,
   AppProfile,
@@ -38,6 +41,7 @@ import type {
   ModelOption,
   ModelStatus,
   OverlayCommand,
+  OverlayResult,
   OverlayState,
   OperationMode,
   PromptPresetId,
@@ -46,6 +50,16 @@ import type {
   UsageStats,
   ViewName,
 } from "./types";
+
+function throttle<Args extends unknown[]>(fn: (...args: Args) => void, ms: number) {
+  let last = 0;
+  return (...args: Args) => {
+    const now = Date.now();
+    if (now - last < ms) return;
+    last = now;
+    fn(...args);
+  };
+}
 
 const DEFAULT_CONFIG: AppConfig = {
   recordingMode: "toggle",
@@ -62,9 +76,9 @@ const DEFAULT_CONFIG: AppConfig = {
   language: "auto",
   mode: "smart",
   translationTarget: "中文",
-  llmProvider: "DeepSeek",
-  llmBaseUrl: "https://api.deepseek.com/v1",
-  llmModel: "deepseek-chat",
+  llmProvider: "千问百炼",
+  llmBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  llmModel: "qwen3.8-max",
   llmTemperature: 0.2,
   dictionary: [],
   autoInsert: true,
@@ -89,6 +103,7 @@ const EMPTY_MODEL: ModelStatus = {
 };
 
 const PROVIDER_PRESETS = [
+  { name: "千问百炼", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen3.8-max" },
   { name: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   { name: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
   { name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
@@ -269,16 +284,33 @@ function MainApp() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [status, setStatus] = useState<AppStatus>("idle");
   const [statusMessage, setStatusMessage] = useState("按下快捷键开始口述");
-  const [level, setLevel] = useState(0);
+  // level 不进 state：录音期间 ≤10Hz 的电平只喂 overlay 序列化，直写 ref + 按需补发，
+  // 主窗树不再随音频 tick 重渲染；波形渲染全部走 levelBus + rAF 直写。
+  const levelRef = useRef(0);
+  const latestOverlayRef = useRef<OverlayState | null>(null);
+  // overlay 状态补发：overlay 窗注册完 listen 回执 overlay-ready 时，据此重发当前值（含实时电平）
+  const emitLatest = () => {
+    if (!latestOverlayRef.current) return;
+    void emitTo("overlay", OVERLAY_STATE_EVENT, { ...latestOverlayRef.current, level: levelRef.current }).catch(() => undefined);
+  };
+  useEffect(() => levelBus.subscribe(throttle((value) => { levelRef.current = value; emitLatest(); }, 100)), []);
   const [rawText, setRawText] = useState("");
   const [renderedText, setRenderedText] = useState("");
   const [resultPreview, setResultPreview] = useState(false);
   const resultPreviewRef = useRef(false);
   const updateResultPreview = (value: boolean) => { resultPreviewRef.current = value; setResultPreview(value); };
+  // F3 文本结果窗载荷（选区编辑/翻译）：与 resultPreview 同生命周期，随浮窗内容一起清空
+  const [overlayResult, setOverlayResultState] = useState<OverlayResult | null>(null);
+  // 结果浮窗在屏标记：浮窗 focusable:false 收不到键盘事件，Esc 的注册/注销守卫须经 ref 同步读
+  const overlayResultRef = useRef<OverlayResult | null>(null);
+  const setOverlayResult = (value: OverlayResult | null) => {
+    overlayResultRef.current = value;
+    setOverlayResultState(value);
+  };
   const [planSession, setPlanSession] = useState<PlanReviewSession | null>(null);
   const planGenerationRef = useRef(0);
   const planBusyRef = useRef(false);
-  const inputTargetRef = useRef<{ editable: boolean; appPid: number | null; reason: string; targetKey?: string } | null>(null);
+  const inputTargetRef = useRef<{ editable: boolean; appPid: number | null; reason: string; targetKey?: string; self?: boolean } | null>(null);
   const previousDictationRef = useRef<ContinuityEntry | null>(null);
   const pendingPreviousRef = useRef<string | undefined>(undefined);
   const recordingTriggerRef = useRef(new RecordingTrigger());
@@ -323,10 +355,7 @@ function MainApp() {
     busy: () => recordingRef.current || pipelineBusyRef.current || selectionBusyRef.current,
     error: (message) => setStatusMessage(message),
     voice: (id, action) => {
-      voiceQuestionRef.current = id;
-      voiceModeLabelRef.current =
-        action === "translate" ? "翻译" : action === "edit" || action === "polish" ? "编辑选区" : "提问";
-      void startRecording("dictate");
+      void startToolRecording(id, action && action !== "edit" ? action : "ask");
     },
     action: async (action) => {
       if (action === "dictate") {
@@ -334,7 +363,7 @@ function MainApp() {
         return;
       }
       if (action === "image" || action === "ocr") {
-        await toolsApi.screenshot(action);
+        await startToolCapture(action);
         return;
       }
       if (action === "copy") {
@@ -350,12 +379,17 @@ function MainApp() {
         addWord(selection.text);
         return;
       }
-      await toolsApi.open(action);
+      await startToolVoice(action as "ask" | "polish" | "translate");
     },
   });
 
   useEffect(() => {
     document.documentElement.dataset.theme = config.theme;
+    if (isTauriRuntime) {
+      for (const label of ["radial", "selectionbar", "result"]) {
+        void emitTo(label, "tools-theme", config.theme).catch(() => undefined);
+      }
+    }
     if (isTauriRuntime) void getCurrentWindow().setTheme(config.theme).catch(() => undefined);
   }, [config.theme, isTauriRuntime]);
   const captureRef = useRef<Capture | null>(null);
@@ -369,6 +403,8 @@ function MainApp() {
   const operationRef = useRef<OperationMode>("dictate");
   const selectedTextRef = useRef("");
   const selectedSnapshotRef = useRef<SelectionSnapshot | null>(null);
+  const toolSessionRef = useRef("");
+  const toolActionRef = useRef("");
   const activeAppRef = useRef("");
   const historyRef = useRef(history);
   const usageStatsRef = useRef(usageStats);
@@ -378,9 +414,9 @@ function MainApp() {
   const finishRecordingRef = useRef<() => void>(() => undefined);
   const cancelCurrentRef = useRef<() => void>(() => undefined);
 
-  const showFloatingOverlay = (expanded = false) => {
+  const showFloatingOverlay = (expanded = false, size?: { width: number; height: number }) => {
     if (!isTauriRuntime) return;
-    void native.showOverlay(expanded).catch((error) => setStatusMessage("悬浮窗显示失败：" + String(error)));
+    void native.showOverlay(expanded, size).catch((error) => setStatusMessage("悬浮窗显示失败：" + String(error)));
   };
 
   const hideFloatingOverlay = () => {
@@ -428,7 +464,7 @@ function MainApp() {
       });
       if (
         escapeRegistrationRef.current !== requestId ||
-        (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current && !toolsEscapeRef.current)
+        (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current && !overlayResultRef.current && !toolsEscapeRef.current)
       ) {
         await unregister(ESCAPE_HOTKEY).catch(() => undefined);
         return;
@@ -450,13 +486,15 @@ function MainApp() {
     const next = pruneHistory(items, retention);
     historyRef.current = next;
     setHistory(next);
+    // SQLite 是桌面端权威存储：独立落盘，不因浏览器存储配额异常被跳过
+    if (isTauriRuntime) {
+      void persist("history", next).catch((error) => setStatusMessage("历史数据库保存失败：" + String(error)));
+    }
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
-      if (isTauriRuntime) {
-        void persist("history", next).catch((error) => setStatusMessage("历史数据库保存失败：" + String(error)));
-      }
     } catch {
-      if (notifyOnError) setStatusMessage("历史记录存储空间不足，已保留当前会话结果");
+      // 桌面端 localStorage 仅作镜像，失败可忽略；浏览器预览仍需提示
+      if (!isTauriRuntime && notifyOnError) setStatusMessage("历史记录存储空间不足，已保留当前会话结果");
     }
   };
 
@@ -557,14 +595,15 @@ function MainApp() {
 
   const resolvePreset = (_appName: string) => config.defaultPreset;
 
-  const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "", fromHold = false) => {
-    if (recordingRef.current || pipelineBusyRef.current || (selectionBusyRef.current && nextOperation === "dictate")) return;
-    if (planSession) { setStatusMessage("请先关闭方案检查，再开始录音"); return; }
+  // 返回 false = 早退（占用/权限/方案检查），录音未真正开始；调用方据此回收已建的会话
+  const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "", fromHold = false): Promise<boolean> => {
+    if (recordingRef.current || pipelineBusyRef.current || (selectionBusyRef.current && nextOperation === "dictate")) return false;
+    if (planSession) { setStatusMessage("请先关闭方案检查，再开始录音"); return false; }
     if (config.asrProvider === "qwen" && !asrTokenSet) {
       setStatus("error");
       setStatusMessage("请先在设置中保存百炼 API Token，或切换本地 Whisper");
       setView("settings");
-      return;
+      return false;
     }
     pipelineBusyRef.current = true;
     cancelRequestedRef.current = false;
@@ -576,7 +615,7 @@ function MainApp() {
         ? previousContext(previousDictationRef.current, inputTargetRef.current.targetKey, "", Date.now(), config.linkPreviousDictation) : undefined;
       if (!pendingPreviousRef.current) previousDictationRef.current = null;
       const capture = createCapture(
-        setLevel,
+        levelBus.set,
         {
           deviceId: config.selectedMicId,
           noiseSuppression: config.noiseSuppression,
@@ -587,7 +626,7 @@ function MainApp() {
       if (cancelRequestedRef.current || (fromHold && !recordingTriggerRef.current.isHolding(nextOperation))) {
         await capture.cancel(); captureRef.current = null; pipelineBusyRef.current = false;
         void unregisterEscapeShortcut();
-        setStatus("idle"); setStatusMessage("按键已松开或任务已取消，本次未开始口述"); return;
+        setStatus("idle"); setStatusMessage("按键已松开或任务已取消，本次未开始口述"); return false;
       }
       recordingClockRef.current = { recordingStartedAt: Date.now(), recordingStartedPerf: performance.now() };
       recordingRef.current = true;
@@ -600,10 +639,12 @@ function MainApp() {
       setRawText("");
       setRenderedText("");
       updateResultPreview(false);
+      setOverlayResult(null);
       setStatus("recording");
       setStatusMessage((nextOperation === "edit" ? "正在聆听编辑指令，" : "正在聆听，") + (fromHold ? "松开快捷键完成" : "再按一次快捷键完成"));
       showFloatingOverlay();
       void registerEscapeShortcut();
+      return true;
     } catch (error) {
       await captureRef.current?.cancel().catch(() => undefined);
       captureRef.current = null;
@@ -618,6 +659,7 @@ function MainApp() {
           ? "当前麦克风不可用，请在设置中切换到系统默认麦克风。"
           : "麦克风不可用：" + detail);
       showFloatingOverlay();
+      return false;
     }
   };
 
@@ -662,6 +704,28 @@ function MainApp() {
       }
     }
     throw lastError;
+  };
+
+  // 焦点在自身时的原生插入：先试主窗口文档，失败则广播给结果窗（独立 webview）并等确认
+  const insertIntoSelf = async (text: string): Promise<boolean> => {
+    if (insertTextAtFocusedEditable(text)) return true;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      let stop: () => void = () => undefined;
+      const done = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        stop();
+        resolve(value);
+      };
+      const timer = window.setTimeout(() => done(false), 250);
+      void listen<boolean>("tools-self-inserted", (event) => done(event.payload === true)).then((off) => {
+        stop = off;
+        if (settled) off();
+      });
+      void emitTo("result", "tools-self-insert", text).catch(() => done(false));
+    });
   };
 
   const finishRecording = async () => {
@@ -717,9 +781,18 @@ function MainApp() {
       if (voiceQuestionRef.current) {
         const id = voiceQuestionRef.current;
         voiceQuestionRef.current = null;
-        await invoke("tools_question", { id, question: transcript });
-        setStatus("ready");
-        hideFloatingOverlay();
+        const toolAction = toolActionRef.current || "ask";
+        toolActionRef.current = "";
+        if (!transcript.trim() && toolAction !== "polish" && toolAction !== "translate") {
+          // ask/image 的转写即问题，空白时没有可执行的问题；polish/translate 本就不依赖语音内容
+          void toolsApi.close().catch(() => undefined);
+          if (toolSessionRef.current === id) toolSessionRef.current = "";
+          setStatus("idle");
+          setStatusMessage("没有识别到清晰语音");
+          hideFloatingOverlay();
+          return;
+        }
+        await runToolSession(id, toolAction, transcript.trim());
         return;
       }
       if (!transcript.trim()) {
@@ -775,27 +848,41 @@ function MainApp() {
       let insertedAt: number | undefined;
       let needsPreview = !config.autoInsert;
       if (currentOperation === "edit") {
-        await invoke("tools_preview", {
+        // F3 结果窗：选区仍精确匹配则直接写入（无插入按钮）；失败落入 [复制] 兜底，不再打开结果窗
+        let written = false;
+        try {
+          await native.applySelection(currentSelectedText, result.text, selectedSnapshotRef.current);
+          written = true;
+          insertedAt = Date.now();
+        } catch (error) {
+          warning = [warning, String(error)].filter(Boolean).join("；");
+        }
+        setOverlayResult({
+          action: "编辑选区",
+          app: currentApp,
           source: currentSelectedText,
-          result: result.text,
-          selection: selectedSnapshotRef.current,
-          action: "edit",
+          text: result.text,
+          writeStatus: written ? "written" : "copy",
         });
         needsPreview = false;
       } else if (config.mode === "translate") {
-        await invoke("tools_preview", {
-          source: transcript,
-          result: result.text,
-          selection: null,
-          action: "translate",
-        });
+        // 翻译没有选区锚点，不做自动写入：F3 结果窗仅提供复制
+        setOverlayResult({ action: "翻译", app: currentApp, source: transcript, text: result.text, writeStatus: "copy" });
         needsPreview = false;
       } else if (config.autoInsert && result.text.trim()) {
         if (cancelRequestedRef.current) {
           hideFloatingOverlay();
           return;
         }
-        if (!(await refreshAccessibilityStatus())) {
+        if (inputTargetRef.current?.self) {
+          // 自家输入框走 DOM 原生插入：零权限、零剪贴板占用、无模拟键盘竞态
+          if (await insertIntoSelf(result.text)) {
+            insertedAt = Date.now();
+          } else {
+            warning = "焦点在 U-Words 自身但没有可插入的输入框，请复制文字";
+            needsPreview = true;
+          }
+        } else if (!(await refreshAccessibilityStatus())) {
           warning = "文字已生成，但未插入：请在设置页授权 macOS 辅助功能";
           needsPreview = true;
         } else if (!inputTargetRef.current?.editable) {
@@ -872,21 +959,126 @@ function MainApp() {
     } finally {
       pipelineBusyRef.current = false;
       recordingClockRef.current = null;
-      setLevel(0);
-      if (!resultPreviewRef.current) void unregisterEscapeShortcut();
+      levelRef.current = 0; levelBus.set(0);
+      if (!resultPreviewRef.current && !overlayResultRef.current) void unregisterEscapeShortcut();
     }
   };
 
   finishRecordingRef.current = () => void finishRecording();
 
+  // 动作中文名与工具条 ACTIONS 单一来源，避免两处文案漂移
+  const toolLabel = (action: string) => ACTIONS[action as ActionId] ?? "处理结果";
+
+  // 工具会话统一执行段：F2 处理 → F3 文本结果 / F4 图片结果；结束即关会话。
+  // 会话在等待期间被关闭（ESC）时 tools_run 返回错误且 toolSessionRef 已变，此处静默退出。
+  const runToolSession = async (id: string, action: string, question: string) => {
+    pipelineBusyRef.current = true;
+    setStatus("rendering");
+    setStatusMessage("");
+    try {
+      const done = await toolsApi.run(id, question);
+      if (toolSessionRef.current !== id) return; // 已被 ESC 关闭
+      if (done.error) throw new Error(done.error);
+      const app = await native.getActiveApp().catch(() => "");
+      if (done.image) {
+        setOverlayResult({ action: toolLabel(action), app, image: done.image, text: done.result });
+      } else {
+        setOverlayResult({ action: toolLabel(action), app, source: done.source, text: done.result, writeStatus: "copy" });
+      }
+      setStatus("ready");
+    } catch (error) {
+      if (toolSessionRef.current !== id) return;
+      // 失败原因走 F3 卡片展示（flash 胶囊放不下长报错，且 Esc/× 可关）；错误态不提供复制/对照
+      setOverlayResult({ action: toolLabel(action), app: "", text: "", error: String(error), writeStatus: "copy" });
+      setStatus("error");
+      setStatusMessage(String(error));
+      showFloatingOverlay();
+    } finally {
+      pipelineBusyRef.current = false;
+      if (toolSessionRef.current === id) {
+        toolSessionRef.current = "";
+        void toolsApi.close().catch(() => undefined); // 会话结束即清理（含 image 内存）
+      }
+    }
+  };
+
+  // 截图工具链：ocr = 截图 → F4 图片解析窗（idle 慢扫）→ 自动识别 → 文字显现；
+  // image = 截图 → F1 语音提问 → F4。截图取消/失败由 action 回调统一报状态，不开浮窗。
+  const startToolCapture = async (captureAction: "image" | "ocr") => {
+    const session = await toolsApi.screenshot(captureAction);
+    if (captureAction !== "ocr") {
+      await startToolRecording(session.id, "image");
+      return;
+    }
+    const app = await native.getActiveApp().catch(() => "");
+    toolSessionRef.current = session.id;
+    setOverlayResult({ action: "截图识字", app, image: session.image ?? undefined, text: "" });
+    setStatus("ready");
+    setStatusMessage("");
+    showFloatingOverlay(false, { width: 362, height: 432 });
+    void registerEscapeShortcut();
+    await runToolSession(session.id, "ocr", "");
+  };
+
+  // 工具语音链 F1：录音转写即问题；startRecording 因权限/占用未真正开始时关掉已建会话
+  const startToolRecording = async (id: string, action: string) => {
+    toolSessionRef.current = id;
+    toolActionRef.current = action;
+    voiceQuestionRef.current = id;
+    voiceModeLabelRef.current = toolLabel(action);
+    const started = await startRecording("dictate");
+    if (!recordingRef.current) {
+      // started=false = startRecording 早退（占用/权限/方案检查），会话未真正建立需回收；
+      // toolSessionRef===id 防止误清已被后续会话占用的状态
+      if (!started && toolSessionRef.current === id) {
+        voiceQuestionRef.current = null;
+        toolSessionRef.current = "";
+        toolActionRef.current = "";
+        void toolsApi.close().catch(() => undefined);
+      }
+    }
+  };
+
+  // 选区工具语音链：ask/polish/translate = 读选区 → F1 录音 → run → F3
+  const startToolVoice = async (action: "ask" | "polish" | "translate") => {
+    const session = await toolsApi.open(action);
+    if (!session.image && !session.source.trim()) {
+      void toolsApi.close().catch(() => undefined);
+      throw new Error("未读取到选区，请先在目标应用中选中文字");
+    }
+    await startToolRecording(session.id, action);
+  };
+
   const cancelCurrent = async () => {
     voiceQuestionRef.current = null;
+    const toolActive = Boolean(toolSessionRef.current);
+    if (toolActive) {
+      // 工具会话（F1 录音中 / OCR 识别中）取消：tools-close 中断模型请求并关闭会话
+      void toolsApi.close().catch(() => undefined);
+      toolSessionRef.current = "";
+      toolActionRef.current = "";
+    }
+    if (toolActive && !recordingRef.current) {
+      // OCR 识别中 / 工具语音 ASR 窗口（runToolSession 尚未开始，无会话守卫）：
+      // 置取消标记并中断后端任务，转写/模型返回后各检查点据此拦截，不会落入普通口述链
+      cancelRequestedRef.current = true;
+      if (isTauriRuntime) void invoke("cancel_processing");
+      pipelineBusyRef.current = false;
+      setOverlayResult(null);
+      setStatus("idle");
+      setStatusMessage("已取消，本次没有生成文字");
+      hideFloatingOverlay();
+      void unregisterEscapeShortcut();
+      return;
+    }
     if (isTauriRuntime) void invoke("cancel_processing");
     recordingTriggerRef.current.cancel();
     previousDictationRef.current = null;
     pendingPreviousRef.current = undefined;
-    if (!recordingRef.current && !pipelineBusyRef.current && resultPreviewRef.current) {
+    if (!recordingRef.current && !pipelineBusyRef.current && (resultPreviewRef.current || overlayResultRef.current)) {
+      // 仅结果浮窗在屏（复制卡片/F3 文本结果/F4 图片结果）：Esc 直接关闭浮窗
       updateResultPreview(false);
+      setOverlayResult(null);
       hideFloatingOverlay();
       void unregisterEscapeShortcut();
       return;
@@ -900,7 +1092,7 @@ function MainApp() {
       pipelineBusyRef.current = false;
       cancelRequestedRef.current = false;
       recordingClockRef.current = null;
-      setLevel(0);
+      levelRef.current = 0; levelBus.set(0);
       setStatus("idle");
       setStatusMessage("已取消，本次没有生成文字");
       hideFloatingOverlay();
@@ -930,6 +1122,7 @@ function MainApp() {
     let unlisten: (() => void) | undefined;
     let stopVoice: (() => void) | undefined;
     let stopToolsEscape: (() => void) | undefined;
+    let stopOverlayReady: (() => void) | undefined;
     let disposed = false;
     void listen<string>("tools-escape", ({ payload }) => {
       toolsEscapeRef.current = payload;
@@ -947,10 +1140,24 @@ function MainApp() {
       if (disposed) off();
       else stopVoice = off;
     });
+    void listen(OVERLAY_READY_EVENT, () => {
+      // overlay 窗注册完 listen 后回执：补发当前状态（首帧主题/在屏结果），消除两窗启动竞态；
+      // 补发同时带上在屏结果图（图片走独立通道，重载后的 overlay 不会丢图）
+      emitLatest();
+      const image = overlayResultRef.current?.image;
+      if (image) void emitTo("overlay", OVERLAY_IMAGE_EVENT, image).catch(() => undefined);
+    }).then((off) => {
+      if (disposed) off();
+      else stopOverlayReady = off;
+    });
     void listen<OverlayCommand>(OVERLAY_COMMAND_EVENT, ({ payload }) => {
       if (payload === "cancel") void cancelCurrentRef.current();
       if (payload === "finish") void finishRecordingRef.current();
-      if (payload === "dismiss") { updateResultPreview(false); hideFloatingOverlay(); void unregisterEscapeShortcut(); }
+      if (payload === "dismiss") {
+        if (toolSessionRef.current) { void toolsApi.close().catch(() => undefined); toolSessionRef.current = ""; }
+        toolActionRef.current = "";
+        updateResultPreview(false); setOverlayResult(null); hideFloatingOverlay(); void unregisterEscapeShortcut();
+      }
     })
       .then((dispose) => {
         unlisten = dispose;
@@ -961,19 +1168,33 @@ function MainApp() {
       unlisten?.();
       stopVoice?.();
       stopToolsEscape?.();
+      stopOverlayReady?.();
     };
   }, [isTauriRuntime]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape" || event.repeat) return;
-      if (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current) return;
+      // 守卫集合须与全局快捷键注册/注销的判定一致：结果浮窗在屏时 Esc 同样接管
+      if (!recordingRef.current && !pipelineBusyRef.current && !resultPreviewRef.current && !overlayResultRef.current) return;
       event.preventDefault();
       void cancelCurrentRef.current();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  // F4 截图 base64 走独立通道：数 MB 图片若随状态帧下发，一次 OCR 会被重复序列化 3+ 次；
+  // 结果清除时补发 null 让 overlay 释放缓存（签名去重：同图只传一次）
+  const lastImageSigRef = useRef("");
+  useEffect(() => {
+    const image = overlayResult?.image;
+    const signature = image ? `${image.length}:${image.slice(-64)}` : "";
+    if (signature === lastImageSigRef.current) return;
+    lastImageSigRef.current = signature;
+    if (!isTauriRuntime) return;
+    void emitTo("overlay", OVERLAY_IMAGE_EVENT, image ?? null).catch(() => undefined);
+  }, [isTauriRuntime, overlayResult]);
 
   useEffect(() => {
     if (!isTauriRuntime) return;
@@ -987,14 +1208,17 @@ function MainApp() {
             : "",
       status,
       operation,
-      level,
+      level: levelRef.current,
       message: statusMessage,
       text: renderedText || rawText,
       theme: config.theme,
       preview: resultPreview,
+      // base64 图片不进状态帧（见上方 overlay-image 通道），overlay 侧合并缓存后渲染
+      result: overlayResult ? { ...overlayResult, image: undefined } : undefined,
     };
+    latestOverlayRef.current = overlayState;
     void emitTo("overlay", OVERLAY_STATE_EVENT, overlayState).catch(() => undefined);
-  }, [config.mode, config.theme, isTauriRuntime, level, operation, rawText, renderedText, resultPreview, status, statusMessage]);
+  }, [config.mode, config.theme, isTauriRuntime, operation, overlayResult, rawText, renderedText, resultPreview, status, statusMessage]);
 
   useEffect(() => {
     let active = true;
@@ -1015,7 +1239,9 @@ function MainApp() {
         const nextHistory = pruneHistory(savedHistory, nextConfig.historyRetention);
         historyRef.current = nextHistory;
         setHistory(nextHistory);
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
+        try {
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
+        } catch { /* 镜像写入失败不影响 SQLite 权威数据 */ }
         void registerShortcuts(nextConfig).catch((error) => setHotkeyError("快捷键注册失败：" + String(error)));
         void listAudioInputs().then(setMicrophones).catch(() => undefined);
       })
@@ -1218,7 +1444,7 @@ function MainApp() {
 
   const testMicrophone = async () => {
     try {
-      const capture = createCapture(setLevel, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression });
+      const capture = createCapture(levelBus.set, { deviceId: config.selectedMicId, noiseSuppression: config.noiseSuppression });
       await capture.start();
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       await capture.stop();
@@ -1230,7 +1456,7 @@ function MainApp() {
       setStatus("error");
       setStatusMessage("麦克风测试失败：" + String(error));
     } finally {
-      setLevel(0);
+      levelRef.current = 0; levelBus.set(0);
     }
   };
 
@@ -1279,6 +1505,7 @@ function MainApp() {
 
   const dismissResult = () => {
     updateResultPreview(false);
+    setOverlayResult(null);
     void unregisterEscapeShortcut();
     setStatus("idle");
     setStatusMessage("准备就绪");
@@ -1297,7 +1524,7 @@ function MainApp() {
     if (recordingRef.current || pipelineBusyRef.current) { setStatusMessage("请等待当前录音或整理完成，再检查方案"); return; }
     planGenerationRef.current += 1;
     planBusyRef.current = false;
-    setPlanSession({ source: text, provider: config.llmUseAsrToken ? "千问百炼 qwen-plus" : config.llmProvider, busy: false });
+    setPlanSession({ source: text, provider: config.llmUseAsrToken ? "千问百炼 qwen3.8-max" : config.llmProvider, busy: false });
   };
   const closePlanReview = () => { planGenerationRef.current += 1; planBusyRef.current = false; setPlanSession(null); };
   const checkPlan = async () => {
@@ -1385,7 +1612,6 @@ function MainApp() {
           <DictateView
             status={status}
             statusMessage={statusMessage}
-            level={level}
             rawText={rawText}
             renderedText={renderedText}
             config={config}
@@ -1488,7 +1714,7 @@ function MainApp() {
       </section>
 
       {!isTauriRuntime && (status === "recording" || status === "transcribing" || status === "rendering" || status === "ready" || status === "error") && (
-        <ActionOverlay status={status} message={statusMessage} level={level} operation={operation} text={renderedText || rawText} onCancel={cancelCurrent} onFinish={toggleRecording} onCopy={copyText} onDismiss={dismissResult} />
+        <ActionOverlay status={status} message={statusMessage} operation={operation} text={renderedText || rawText} onCancel={cancelCurrent} onFinish={toggleRecording} onCopy={copyText} onDismiss={dismissResult} />
       )}
       {confirmAction && (
         <ConfirmDialog
@@ -1556,14 +1782,14 @@ function HomeView({ config, asrTokenSet, history, usageStats, model, status, onS
   );
 }
 
-function DictateView({ status, statusMessage, level, rawText, renderedText, config, operation, selectedText, onToggle, onStartEdit, onModeChange, onLanguageChange, onCopy, onReview }: { status: AppStatus; statusMessage: string; level: number; rawText: string; renderedText: string; config: AppConfig; operation: OperationMode; selectedText: string; onToggle: () => void; onStartEdit: () => void; onModeChange: (mode: DictationMode) => void; onLanguageChange: (language: AppConfig["language"]) => void; onCopy: (text: string) => void; onReview: (text: string) => void }) {
+function DictateView({ status, statusMessage, rawText, renderedText, config, operation, selectedText, onToggle, onStartEdit, onModeChange, onLanguageChange, onCopy, onReview }: { status: AppStatus; statusMessage: string; rawText: string; renderedText: string; config: AppConfig; operation: OperationMode; selectedText: string; onToggle: () => void; onStartEdit: () => void; onModeChange: (mode: DictationMode) => void; onLanguageChange: (language: AppConfig["language"]) => void; onCopy: (text: string) => void; onReview: (text: string) => void }) {
   return (
     <div className="page dictate-page">
       <div className="toolbar"><div className="segmented"><button className={config.mode === "smart" ? "selected" : ""} onClick={() => onModeChange("smart")}>智能渲染</button><button className={config.mode === "translate" ? "selected" : ""} onClick={() => onModeChange("translate")}>翻译</button><button className={config.mode === "literal" ? "selected" : ""} onClick={() => onModeChange("literal")}>只转写</button></div><div className="toolbar-actions"><AsrLanguageSelect value={config.language} local={config.asrProvider === "local"} onChange={onLanguageChange} /></div></div>
       {operation === "edit" && selectedText && <div className="selection-preview"><span>当前选区</span><p>{selectedText}</p><small>录音结束后，结果会替换这段文字</small></div>}
       <section className={"record-panel " + (status === "recording" ? "recording" : "")}>
         <div className="record-icon"><span className="mic-glyph">{status === "error" ? "!" : "●"}</span></div>
-        <div className="waveform">{Array.from({ length: 25 }, (_, index) => <i key={index} style={{ height: (8 + level * (20 + ((index * 17) % 23))) + "px" }} />)}</div>
+        <Waveform className="waveform" barCount={25} />
         <strong>{status === "recording" ? operation === "edit" ? "正在聆听编辑指令…" : "正在聆听…" : statusMessage}</strong>
         <div className="record-actions"><button className="record-button" onClick={onToggle}>{status === "recording" ? <><span>✓</span>结束并整理</> : <><span>●</span>开始口述</>}</button><button className="cancel-button compact" onClick={onStartEdit}><span>✎</span>编辑选区</button></div>
         <small>口述 {formatShortcut(config.hotkey)} · 编辑 {formatShortcut(config.editHotkey)}</small>
@@ -1655,7 +1881,7 @@ function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiK
       {config.appProfiles.length > 0 && <div className="profile-list">{config.appProfiles.map((profile: AppProfile) => <div className="profile-row" key={profile.appName}><span>{profile.appName}</span><span className="history-tag">{presetLabel(profile.preset)}</span><button className="icon-action danger" onClick={() => onRemoveProfile(profile.appName)} aria-label={`移除 ${profile.appName}`}>×</button></div>)}</div>}
     </SettingsGroup>
     <SettingsGroup title="大模型渲染" hint="仅在智能渲染、翻译或选区编辑时调用。API Key 使用系统凭据库保存，不写入前端或普通配置文件。">
-      {config.llmUseAsrToken ? <div className="setting-note">当前使用千问 qwen-plus，复用所选地域的百炼 Token，无需再次填写。识别与文字整理分别计费。关闭上方“同一 Token 用于文字整理”即可恢复原服务商配置。</div> : <>
+      {config.llmUseAsrToken ? <div className="setting-note">当前使用千问旗舰模型 qwen3.8-max（官方最新最强，文本与图片理解一体），复用所选地域的百炼 Token，无需填写模型。识别与文字整理分别计费。关闭上方“同一 Token 用于文字整理”即可恢复原服务商配置。</div> : <>
         <div className="setting-row stacked"><label>服务商</label><select value={config.llmProvider} onChange={(event) => onProviderPreset(event.target.value)}>{PROVIDER_PRESETS.map((preset) => <option key={preset.name} value={preset.name}>{preset.name}</option>)}</select></div>
         <div className="setting-row stacked"><label>Base URL</label><input value={config.llmBaseUrl} onChange={(event) => onConfigChange({ llmBaseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></div>
         <div className="setting-row stacked"><label>Model</label><input value={config.llmModel} onChange={(event) => onConfigChange({ llmModel: event.target.value })} placeholder="model-name" /></div>
@@ -1666,7 +1892,7 @@ function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiK
     <SettingsGroup title="历史保留" hint="历史记录默认只保存在本机，不保存原始音频。">
       <div className="setting-row"><div><strong>保留时间</strong><small>超过时间的历史会在应用启动或设置变更时清理</small></div><select value={config.historyRetention} onChange={(event) => onConfigChange({ historyRetention: event.target.value as HistoryRetention })}><option value="1">1 天</option><option value="7">7 天</option><option value="30">30 天</option><option value="forever">永久</option></select></div>
     </SettingsGroup>
-<div className="about-note"><span>◌</span><div><strong>U-Words 0.7.0</strong><p>选区工具、长按转盘、图片提问与确认后替换</p></div></div>
+<div className="about-note"><span>◌</span><div><strong>U-Words 0.8.0</strong><p>默认千问旗舰 qwen3.8-max；选区工具、图片提问与确认后替换</p></div></div>
   </div>;
 }
 
@@ -1680,7 +1906,7 @@ function CloudAsrSettings({ config, tokenSet, tokenInput, busy, shareToken, feed
     <div className="setting-row"><div><strong>服务地域</strong><small>默认北京；仅新加坡 Token 需要切换。两个地域的 Token 分别保存。</small></div><select aria-label="千问服务地域" value={config.asrRegion} onChange={(event) => onConfigChange({ asrRegion: event.target.value as AppConfig["asrRegion"] })} disabled={busy}><option value="beijing">北京（默认）</option><option value="singapore">新加坡</option></select></div>
     <div className="setting-row stacked cloud-token-row"><label htmlFor="asr-token">百炼 Token <span className="key-state">{tokenSet ? "已保存 · 未联网验证" : "待填写"}</span></label><div className="key-input"><input id="asr-token" type="password" autoComplete="off" spellCheck={false} value={tokenInput} onChange={(event) => onTokenChange(event.target.value)} placeholder={tokenSet ? "粘贴新 Token 以替换" : "粘贴百炼 API Key（sk-…）"} disabled={busy} /><button className="outline-button" disabled={busy || !tokenInput.trim()} onClick={onSave}>{busy ? "保存中…" : "保存并启用"}</button>{tokenSet && <button className="quiet-button" disabled={busy} onClick={onClear}>清除 Token</button>}</div></div>
     <div className="setting-note" role="status" aria-live="polite">{feedback}</div>
-    <div className="setting-row"><div><strong>同一 Token 用于文字整理</strong><small>使用 qwen-plus 完成整理与翻译；原 DeepSeek / 智谱配置保留，不覆盖其 Key。</small></div><button className={"toggle " + (shareToken ? "on" : "")} role="switch" aria-checked={shareToken} aria-label="同一 Token 用于文字整理" disabled={busy} onClick={() => onShareChange(!shareToken)}><span /></button></div>
+    <div className="setting-row"><div><strong>同一 Token 用于文字整理</strong><small>使用千问旗舰 qwen3.8-max 完成整理与翻译；原其他服务商配置保留，不覆盖其 Key。</small></div><button className={"toggle " + (shareToken ? "on" : "")} role="switch" aria-checked={shareToken} aria-label="同一 Token 用于文字整理" disabled={busy} onClick={() => onShareChange(!shareToken)}><span /></button></div>
     <div className="setting-row"><div><strong>网络失败回退本地</strong><small>网络、超时、限流和服务端失败可回退；无效 Token 或权限错误会明确提示。</small></div><Toggle value={config.asrFallbackLocal} onChange={() => onConfigChange({ asrFallbackLocal: !config.asrFallbackLocal })} /></div>
     <div className="setting-row"><div><strong>数字标准化</strong><small>将“一百二十三”等转为“123”；默认关闭，保留原始转写表达。</small></div><Toggle value={config.asrEnableItn} onChange={() => onConfigChange({ asrEnableItn: !config.asrEnableItn })} /></div>
     <div className="setting-note">识别模型：qwen3-asr-flash。支持中英文和混说；个人词典作为识别上下文。音频会离开本机并提交至所选百炼地域，识别与整理分别按服务商规则计费。16 kHz WAV 的 Base64 有 10 MB 限制，建议每段不超过约 3 分钟。</div>
@@ -1695,8 +1921,8 @@ function Toggle({ value, onChange }: { value: boolean; onChange: () => void }) {
   return <button className={"toggle " + (value ? "on" : "")} onClick={onChange} aria-label={value ? "已开启" : "已关闭"}><span /></button>;
 }
 
-function ActionOverlay({ status, message, level, operation, text, onCancel, onFinish, onCopy, onDismiss }: { status: AppStatus; message: string; level: number; operation: OperationMode; text: string; onCancel: () => void; onFinish: () => void; onCopy: (text: string) => void; onDismiss: () => void }) {
-  if (status === "recording") return <div className="action-overlay recording-overlay"><div className="overlay-symbol pulse">●</div><div className="overlay-copy"><strong>{operation === "edit" ? "正在聆听编辑指令" : "正在聆听"}</strong><small>{message}</small></div><div className="mini-wave">{Array.from({ length: 8 }, (_, index) => <i key={index} style={{ height: `${5 + level * (8 + index % 4 * 5)}px` }} />)}</div><div className="overlay-actions"><button className="cancel-button" onClick={onCancel}><span>×</span>取消</button><button className="confirm-button" onClick={onFinish}><span>✓</span>完成</button></div></div>;
+function ActionOverlay({ status, message, operation, text, onCancel, onFinish, onCopy, onDismiss }: { status: AppStatus; message: string; operation: OperationMode; text: string; onCancel: () => void; onFinish: () => void; onCopy: (text: string) => void; onDismiss: () => void }) {
+  if (status === "recording") return <div className="action-overlay recording-overlay"><div className="overlay-symbol pulse">●</div><div className="overlay-copy"><strong>{operation === "edit" ? "正在聆听编辑指令" : "正在聆听"}</strong><small>{message}</small></div><Waveform className="mini-wave" barCount={8} /><div className="overlay-actions"><button className="cancel-button" onClick={onCancel}><span>×</span>取消</button><button className="confirm-button" onClick={onFinish}><span>✓</span>完成</button></div></div>;
   if (status === "transcribing" || status === "rendering") return <div className="action-overlay processing-overlay"><div className="overlay-symbol spinner">◌</div><div className="overlay-copy"><strong>{status === "transcribing" ? "本地 Whisper 正在识别" : operation === "edit" ? "正在替换选区" : "正在整理文字"}</strong><small>{message}</small></div><button className="cancel-button" onClick={onCancel}><span>×</span>取消</button></div>;
   if (status === "ready") return <div className="action-overlay ready-overlay"><div className="overlay-symbol ready">✓</div><div className="overlay-copy"><strong>{operation === "edit" ? "选区已处理" : "文字已准备好"}</strong><small>{message}</small></div><div className="overlay-actions"><button className="quiet-button" onClick={() => onCopy(text)}>复制</button><button className="icon-action" onClick={onDismiss} aria-label="关闭提示">×</button></div></div>;
   return <div className="action-overlay error-overlay"><div className="overlay-symbol error">!</div><div className="overlay-copy"><strong>这次没有完成</strong><small>{message}</small></div><div className="overlay-actions">{text && <button className="quiet-button" onClick={() => onCopy(text)}>复制原文</button>}<button className="icon-action" onClick={onDismiss} aria-label="关闭错误提示">×</button></div></div>;
@@ -1715,12 +1941,92 @@ const INITIAL_OVERLAY_STATE: OverlayState = {
   theme: "dark",
 };
 
+const PREVIEW_AUTO_CLOSE_SECONDS = 15;
+const COPY_FEEDBACK_MS = 3000;
+
 function OverlayApp() {
   const [state, setState] = useState<OverlayState>(INITIAL_OVERLAY_STATE);
   const [copyFeedback, setCopyFeedback] = useState("");
-  useEffect(() => { setCopyFeedback(""); }, [state.text, state.status]);
+  const [countdown, setCountdown] = useState(0);
+  const [exiting, setExiting] = useState(false);
+  // F4 图片缓存：状态帧剥离 base64，图片经 overlay-image 独立事件到达后合并回 result 再渲染
+  const [image, setImage] = useState<string | null>(null);
+  const copyTimer = useRef(0);
+  const exitingRef = useRef(false);
+  // 记录本次退场发起时的 stage：录音/处理中的取消不向主窗补发 dismiss（避免误关新会话）
+  const exitStageRef = useRef<ReturnType<typeof resolveStage>>(null);
+  const previewOpen = Boolean(state.preview && state.text.trim());
+  const mergedState: OverlayState = state.result && image ? { ...state, result: { ...state.result, image } } : state;
+  const stageKind = resolveStage(mergedState);
+  const resultKey = state.result ? `${state.result.writeStatus ?? ""}|${state.result.text}` : "";
+
+  // 统一出口：先播 160ms 退场动画（CapsuleStage），完成回调里真正 hide 窗口
+  const exitAndHide = () => {
+    if (exitingRef.current) return;
+    exitingRef.current = true;
+    exitStageRef.current = stageKind;
+    setExiting(true);
+  };
+
+  const handleExited = () => {
+    exitingRef.current = false;
+    setExiting(false);
+    void native.hideOverlay().catch(() => undefined);
+    // 自动关闭路径（written 1.2s / 复制预览倒计时 / flash 超时）不经主窗 dismiss，这里补发清掉结果载荷；
+    // 录音/处理中的取消由主窗自行清理不补发；手动 dismiss/Esc 重复发送，主窗侧全是幂等清除
+    if (exitStageRef.current !== "record" && exitStageRef.current !== "process") {
+      void emitTo("main", OVERLAY_COMMAND_EVENT, "dismiss").catch(() => undefined);
+    }
+    exitStageRef.current = null;
+  };
 
   useEffect(() => {
+    setCopyFeedback("");
+    window.clearTimeout(copyTimer.current);
+  }, [state.text, resultKey, state.status]);
+
+  // F3 自动写入成功：无按钮，1.2s 后收缩淡出（exitAndHide 内含 160ms 退场动画）
+  useEffect(() => {
+    if (stageKind !== "text" || state.result?.writeStatus !== "written") return;
+    const timer = window.setTimeout(() => exitAndHide(), 1200);
+    return () => window.clearTimeout(timer);
+  }, [stageKind, resultKey]);
+
+  // 退场期间又来了新的录音状态：中断退场，恢复常态（用户在 160ms 内再次开始录音）
+  useEffect(() => {
+    if (!exiting || resolveStage(state) !== "record") return;
+    exitingRef.current = false;
+    setExiting(false);
+  }, [exiting, state]);
+
+  // 取消路径对称复位：主窗先置 idle 再 hide 窗口，stage→null 会掐掉退场弹簧，
+  // 退场完成回调不再触发，这里复位 exiting，避免退出标志卡死导致后续 exitAndHide 空转
+  useEffect(() => {
+    if (!exiting || stageKind !== null) return;
+    exitingRef.current = false;
+    setExiting(false);
+  }, [exiting, stageKind]);
+
+  // 复制预览窗：左上角倒计时，归零后自动关闭（兜底窗口不再常驻）
+  useEffect(() => {
+    if (!previewOpen) {
+      setCountdown(0);
+      return;
+    }
+    setCountdown(PREVIEW_AUTO_CLOSE_SECONDS);
+    const deadline = Date.now() + PREVIEW_AUTO_CLOSE_SECONDS * 1000;
+    const tick = window.setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      setCountdown(remaining);
+      if (remaining > 0) return;
+      window.clearInterval(tick);
+      exitAndHide();
+    }, 250);
+    return () => window.clearInterval(tick);
+  }, [previewOpen, state.text]);
+
+  // 首帧主题：layout effect 在绘制前落地，避免浅色用户看到一帧深色
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = state.theme;
   }, [state.theme]);
 
@@ -1728,53 +2034,70 @@ function OverlayApp() {
     document.documentElement.classList.add("overlay-window");
     document.body.classList.add("overlay-window");
     let unlisten: (() => void) | undefined;
+    let unlistenImage: (() => void) | undefined;
     void listen<OverlayState>(OVERLAY_STATE_EVENT, ({ payload }) => setState(payload))
       .then((dispose) => {
         unlisten = dispose;
+        // listen 注册完成后再回执：主窗若抢先下发过状态（事件丢失），可经 overlay-ready 补发
+        void emitTo("main", OVERLAY_READY_EVENT).catch(() => undefined);
+      })
+      .catch(() => undefined);
+    void listen<string | null>(OVERLAY_IMAGE_EVENT, ({ payload }) => setImage(payload))
+      .then((dispose) => {
+        unlistenImage = dispose;
       })
       .catch(() => undefined);
     return () => {
       unlisten?.();
+      unlistenImage?.();
       document.documentElement.classList.remove("overlay-window");
       document.body.classList.remove("overlay-window");
     };
   }, []);
 
   useEffect(() => {
-    if (state.preview || (state.status !== "ready" && state.status !== "error")) return;
+    // F3/F4 结果窗有自己的关闭节奏（written 1.2s / copy 常驻 / F4 识别中+结果），不吃 flash 自动隐藏
+    if (state.preview || stageKind === "text" || stageKind === "image" || (state.status !== "ready" && state.status !== "error")) return;
     const timeout = window.setTimeout(() => {
-      void native.hideOverlay().catch(() => undefined);
+      exitAndHide();
     }, state.status === "ready" ? 900 : 4500);
     return () => window.clearTimeout(timeout);
-  }, [state.status, state.preview]);
+  }, [stageKind, state.status, state.preview]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      void emitTo("main", OVERLAY_COMMAND_EVENT, "cancel").catch(() => undefined);
-      void native.hideOverlay().catch(() => undefined);
+      // 录音/处理中 = 取消任务；结果/提示态 = 关闭浮窗（同时让主窗清掉结果载荷）
+      void emitTo("main", OVERLAY_COMMAND_EVENT, stageKind === "record" || stageKind === "process" ? "cancel" : "dismiss").catch(() => undefined);
+      exitAndHide();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [stageKind]);
 
   const sendCommand = (command: OverlayCommand) => {
     if (command === "copy") {
-      void native.copyText(state.text).then(() => setCopyFeedback("已复制"), () => setCopyFeedback("复制失败，请重试"));
+      void native.copyText(state.result?.text ?? state.text).then(
+        () => setCopyFeedback("已复制"),
+        () => setCopyFeedback("复制失败"),
+      ).finally(() => {
+        window.clearTimeout(copyTimer.current);
+        copyTimer.current = window.setTimeout(() => setCopyFeedback(""), COPY_FEEDBACK_MS);
+      });
       return;
     }
     void emitTo("main", OVERLAY_COMMAND_EVENT, command).catch(() => undefined);
-    if (command === "cancel" || command === "dismiss") void native.hideOverlay().catch(() => undefined);
+    if (command === "cancel" || command === "dismiss") exitAndHide();
   };
-  return <OverlayView state={{ ...state, copyFeedback }} onCommand={sendCommand} />;
+  return <CapsuleStage state={{ ...mergedState, copyFeedback, countdown }} exiting={exiting} onCommand={sendCommand} onExited={handleExited} />;
 }
 
 export default function App() {
   const toolKind = currentWindowLabel();
   if (["result", "radial", "selectionbar"].includes(toolKind)) return <ContextTools kind={toolKind} />;
   const preview = new URLSearchParams(window.location.search).get("toolsPreview");
-  if (import.meta.env.DEV && preview) return <ContextTools kind={preview} preview />;
+  if (import.meta.env.DEV && preview) return <div className={`tools-preview-stage preview-${preview}`}><ContextTools kind={preview} preview /></div>;
   if (import.meta.env.DEV && !hasTauriRuntime() && new URLSearchParams(window.location.search).has("overlayPreview")) {
     return <OverlayPreview />;
   }

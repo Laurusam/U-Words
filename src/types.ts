@@ -22,6 +22,26 @@ export type AsrLanguage = typeof ASR_LANGUAGES[number][0];
 
 export const OVERLAY_STATE_EVENT = "u-words-overlay-state";
 export const OVERLAY_COMMAND_EVENT = "u-words-overlay-command";
+// F4 截图 base64 独立通道：数 MB 图片不随每次状态帧重复序列化下发
+export const OVERLAY_IMAGE_EVENT = "u-words-overlay-image";
+// overlay 窗注册完 listen 后的回执事件：主窗据此补发当前状态，消除两窗启动竞态
+export const OVERLAY_READY_EVENT = "u-words-overlay-ready";
+
+/**
+ * F3 文本结果窗载荷（选区编辑/翻译）：默认只显示最终结果；
+ * writeStatus written = 已直接写入原选区（无按钮，1.2s 后自动收缩淡出），copy = 仅提供 [复制]。
+ * source 供 ⌄ 展开后的原文对照 diff；image 为 C3 图片解析预留；
+ * error = 工具会话失败原因，F3 卡片以 role=alert 展示且不提供复制/对照。
+ */
+export type OverlayResult = {
+  source?: string;
+  text: string;
+  writeStatus?: "written" | "copy";
+  action?: string;
+  app?: string;
+  image?: string;
+  error?: string;
+};
 
 export type OverlayState = {
   label?: string;
@@ -32,12 +52,15 @@ export type OverlayState = {
   text: string;
   theme: AppTheme;
   preview?: boolean;
+  result?: OverlayResult;
   copyFeedback?: string;
+  /** 复制预览窗自动关闭剩余秒数；仅 overlay 窗口内部计算，主窗不下发 */
+  countdown?: number;
 };
 
 export type OverlayCommand = "cancel" | "finish" | "dismiss" | "copy";
 
-export type InputTarget = { editable: boolean; appPid: number | null; reason: string; targetKey?: string };
+export type InputTarget = { editable: boolean; appPid: number | null; reason: string; targetKey?: string; self?: boolean };
 export type PlanReview = {
   organizedPlan: string;
   issues: { title: string; evidence: string; detail: string }[];

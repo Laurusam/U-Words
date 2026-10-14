@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use image::ImageEncoder;
 use std::fs;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 struct CaptureRestore {
     app: AppHandle,
@@ -20,10 +20,9 @@ impl Drop for CaptureRestore {
             if let Some(previous)=self.previous.take(){
                 if let Ok(mut guard)=self.app.state::<ToolsState>().session.lock(){
                     // Never resurrect a session explicitly closed during capture.
+                    // C4 result 窗退役：恢复只写回状态存储，不再把含图 Session 推给不可见窗口
                     if guard.as_ref().map(|s|s.id.as_str())==Some(previous.id.as_str()){
-                        *guard=Some(previous.clone());
-                        let _=self.app.emit_to("result","tools-session",&previous);
-                        if let Some(w)=self.app.get_webview_window("result"){let _=w.show();}
+                        *guard=Some(previous);
                     }
                 }
             }
@@ -59,13 +58,10 @@ fn normalize(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn capture_failure(app: &AppHandle, id: &str, message: &str) {
+    // C4 result 窗退役：错误只写入会话状态，由调用方把消息返回给前端展示
     if let Ok(mut guard) = app.state::<ToolsState>().session.lock() {
         if let Some(session) = guard.as_mut().filter(|s| s.id == id) {
             session.error = Some(message.into());
-            let _ = app.emit_to("result", "tools-session", &*session);
-            if let Some(window) = app.get_webview_window("result") {
-                let _ = window.show();
-            }
         }
     }
 }
@@ -165,11 +161,8 @@ pub async fn capture_region(app: AppHandle, action: Option<String>) -> Result<Se
             s.messages.clear();s.result.clear();s.error=None;
             s.clone()
         };
-        let _ = app.emit_to("result", "tools-session", &result);
-        if let Some(window) = app.get_webview_window("result") {
-            let _ = context_tools::position(&app, &window, 460., 480., None);
-            let _ = window.show();
-        }
+        // C4 result 窗退役：截图识字（ocr）走 overlay F4，截图提问（image）走 F1 语音链，
+        // 结果都由 overlay 承载，不再弹出 result 窗；含图 Session 只经返回值交付前端。
         restore.completed=true;
         Ok(result)
     }
@@ -212,9 +205,8 @@ pub fn attach_image(app: AppHandle, id: String, data: Option<String>) -> Result<
     }
     session.messages.clear();
     session.result.clear();
-    let result = session.clone();
-    let _ = app.emit_to("result", "tools-session", &result);
-    Ok(result)
+    // C4 result 窗退役：不向不可见窗口推送，结果经返回值交付调用方
+    Ok(session.clone())
 }
 
 #[tauri::command]

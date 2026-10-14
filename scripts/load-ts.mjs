@@ -5,6 +5,8 @@ import ts from "typescript";
 const require = createRequire(import.meta.url);
 export async function loadTs(url) {
   let text = ts.transpileModule(await readFile(url, "utf8"), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
+  // 样式副作用导入与 node 测试无关，直接剥离（如 import "./capsule.css"）
+  text = text.replace(/^[ \t]*import "[^"]+\.css";[ \t]*$/gm, "");
   for (const [, spec] of [...text.matchAll(/from "([^"]+)"/g)]) {
     let resolved;
     if (spec.startsWith(".")) {

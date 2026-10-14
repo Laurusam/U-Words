@@ -43,6 +43,12 @@ export function useContextTools(options: ContextToolsOptions) {
       await emitTo("main", "tools-escape", kind);
     };
 
+    // C4：菜单退场交给窗口自己播完动画后再 tools_hide_menu，这里只发事件；
+    // 卸载清理仍走底部强制 hide，不等动画。
+    const dismissMenu = (kind: "radial" | "selectionbar") => {
+      void emitTo(kind, "tools-menu-dismiss").catch(() => undefined);
+    };
+
     const configure = async () => {
       const config = await toolsApi.config();
       const candidates = [
@@ -72,8 +78,7 @@ export function useContextTools(options: ContextToolsOptions) {
                     void toolsApi
                       .show("radial")
                       .then(() => {
-                        if (pressed) return escape("radial");
-                        return toolsApi.hide("radial");
+                        if (!disposed) return escape("radial");
                       })
                       .catch((error) => latest.current.error(String(error)));
                   }
@@ -82,11 +87,7 @@ export function useContextTools(options: ContextToolsOptions) {
               if (event.state === "Released") {
                 pressed = false;
                 clearTimeout(timer);
-                if (open) {
-                  open = false;
-                  void escape("");
-                  void emitTo("radial", "tools-radial-release");
-                }
+                // Release only ends the hold gesture. The palette stays open.
               }
             } else if (event.state === "Pressed") {
               void latest.current
@@ -119,31 +120,43 @@ export function useContextTools(options: ContextToolsOptions) {
       else stopConfig = stop;
     });
     void listen<ActionId>("tools-action", (event) => {
-      void toolsApi.hide("radial");
-      void toolsApi.hide("selectionbar");
+      // 与快捷键/语音入口同款 busy 守卫：录音/处理进行中忽略转盘/选区条动作，防劫持进行中的会话
+      if (latest.current.busy()) return;
+      // open/escape 的复位由 tools_hide_menu 触发的 tools-radial-closed 回环统一处理，避免重复 escape
+      dismissMenu("radial");
+      dismissMenu("selectionbar");
       dismissed = shown;
       void latest.current.action(event.payload).catch((error) => latest.current.error(String(error)));
     }).then((stop) => {
       if (disposed) stop();
       else stops.push(stop);
     });
-    void listen<{ id: string; action?: string }>("tools-voice-question", (event) =>
-      latest.current.voice(event.payload.id, event.payload.action),
-    ).then((stop) => {
+    void listen("tools-radial-closed", () => {
+      open = false;
+      void escape("");
+    }).then((stop) => {
+      if (disposed) stop();
+      else stops.push(stop);
+    });
+    void listen<{ id: string; action?: string }>("tools-voice-question", (event) => {
+      // 与快捷键路径同款 busy 守卫：录音/处理进行中忽略重复触发，防双击竞态劫持/覆盖工具会话
+      if (latest.current.busy()) return;
+      latest.current.voice(event.payload.id, event.payload.action);
+    }).then((stop) => {
       if (disposed) stop();
       else stops.push(stop);
     });
     void listen<boolean>("tools-active", (event) => {
       activeResult = event.payload;
       void escape(activeResult ? "result" : "");
-      if (activeResult) void toolsApi.hide("selectionbar");
+      if (activeResult) dismissMenu("selectionbar");
     }).then((stop) => {
       if (disposed) stop();
       else stops.push(stop);
     });
     void listen("tools-dismiss-selection", () => {
       dismissed = shown;
-      void toolsApi.hide("selectionbar");
+      dismissMenu("selectionbar");
     }).then((stop) => {
       if (disposed) stop();
       else stops.push(stop);
@@ -160,7 +173,7 @@ export function useContextTools(options: ContextToolsOptions) {
         const config = await toolsApi.config();
         if (!config.selectionEnabled || activeResult || open || latest.current.busy()) {
           if (shown) {
-            void toolsApi.hide("selectionbar");
+            dismissMenu("selectionbar");
             shown = "";
           }
           return;
@@ -173,7 +186,7 @@ export function useContextTools(options: ContextToolsOptions) {
           previous = selection;
           stableAt = Date.now();
           shown = "";
-          await toolsApi.hide("selectionbar");
+          dismissMenu("selectionbar");
           return;
         }
         if (selection && fingerprint !== shown && fingerprint !== dismissed && Date.now() - stableAt >= config.selectionDelayMs) {

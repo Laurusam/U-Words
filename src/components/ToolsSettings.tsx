@@ -72,16 +72,9 @@ export function ToolsSettings() {
         选区提问快捷键
         <input value={config.askHotkey} onChange={(event) => patch({ askHotkey: event.target.value })} />
       </label>
-      <label>
-        图片理解模型
-        <input
-          placeholder="填写当前服务支持的视觉模型名称"
-          value={config.visionModel}
-          onChange={(event) => patch({ visionModel: event.target.value })}
-        />
-      </label>
       <p className="tools-note">
-        图片理解复用文字模型的服务地址与 Key；共享百炼 Token 时使用百炼地址。模型须支持图片，保存不等于已验证。图片只在点击发送时上传
+        图片理解与文字整理均使用应用内置的千问旗舰 qwen3.8-max（官方最新最强），无需配置模型；
+        复用百炼 Token 或当前服务地址与 Key。图片只在点击发送时上传
       </p>
       <label>
         转盘格数
@@ -118,7 +111,7 @@ export function ToolsSettings() {
           </label>
         ))}
       </div>
-      <p className="tools-note">口述快捷键保持原有行为；转盘松开只确认操作。编辑与提问结果进入可关闭浮窗，不自动改写原文</p>
+      <p className="tools-note">长按唤出转盘，松开后保持显示；点击功能执行，点击中心或转盘外部取消。口述快捷键保持原有行为</p>
       <button onClick={() => void save()}>保存快捷工具设置</button>
       {message && (
         <p className="tools-note" role="status">
