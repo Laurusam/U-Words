@@ -12,6 +12,7 @@ mod overlay;
 mod overlay_layout;
 mod platform;
 mod recorder;
+mod scenes;
 mod selection;
 mod storage;
 #[cfg(test)]

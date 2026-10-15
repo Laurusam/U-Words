@@ -8,6 +8,7 @@ export type TranscribeRequest = {
   sampleRate: number;
   language: AppConfig["language"];
   dictionary: string[];
+  scenes: string[];
   model: string;
   quality: AppConfig["recognitionQuality"];
 };
@@ -18,13 +19,13 @@ export type RenderRequest = {
   language: AppConfig["language"];
   targetLanguage: AppConfig["translationTarget"];
   dictionary: string[];
+  scenes: string[];
   baseUrl: string;
   model: string;
   provider: string;
   temperature: number;
   operation: "dictate" | "edit";
   preset: AppConfig["defaultPreset"];
-  appName: string;
   selectedText?: string;
   previousText?: string;
   candidates: TranscriptCandidate[];
@@ -47,7 +48,8 @@ export const native = {
   reviewPlan: (text: string) => invoke<PlanReview>("review_plan", { text }),
   getInputTarget: () => invoke<InputTarget>("get_input_target"),
   copyText: (text: string) => invoke<void>("copy_text", { text }),
-  pasteText: (text: string, expectedPid?: number | null) => invoke<void>("paste_text", { text, expectedPid: expectedPid ?? null }),
+  pasteText: (text: string, expectedPid?: number | null, expectedKey?: string | null) =>
+    invoke<void>("paste_text", { text, expectedPid: expectedPid ?? null, expectedKey: expectedKey ?? null }),
   getSelectedText: () => invoke<string>("get_selected_text"),
   getActiveApp: () => invoke<string>("get_active_app"),
   getAccessibilityStatus: () => invoke<boolean>("get_accessibility_status"),

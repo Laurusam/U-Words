@@ -220,3 +220,33 @@ test("P0 cancellation and lifecycle guards: tool ASR cancel, SQLite-first histor
   assert.match(capsule, /if \(!restoreCursorRef\.current\) return; \/\/ 幂等：完成与中断只恢复一次/);
   assert.match(capsule, /restoreCursorRef\.current\?\.\(\);/);
 });
+
+test("A/B robustness contracts: usage SQLite-first, session generation guard, overlay local level bus", async () => {
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  // A1 用量统计与 history 同模式：persist("usage") 独立落盘，先于 localStorage try
+  for (const marker of ["const recordUsage = (", "const resetUsageStats = () => {"]) {
+    const segment = app.slice(app.indexOf(marker), app.indexOf(marker) + 1200);
+    const persistAt = segment.indexOf('void persist("usage"');
+    const tryAt = segment.indexOf("try {");
+    assert.ok(persistAt >= 0 && tryAt > persistAt, `${marker} 的 persist("usage") 必须先于 localStorage try 执行`);
+  }
+  // A2 会话代数守卫：取消后新录音启动时，旧会话迟到回包静默丢弃、finally 不踩新会话状态
+  assert.match(app, /const pipelineGenerationRef = useRef\(0\);/);
+  assert.match(app, /pipelineGenerationRef\.current \+= 1;/);
+  assert.match(app, /const generation = pipelineGenerationRef\.current;/);
+  assert.match(app, /const stale = \(\) => generation !== pipelineGenerationRef\.current;/);
+  const finishStart = app.indexOf("const finishRecording = async () => {");
+  const finish = app.slice(finishStart, app.indexOf("finishRecordingRef.current", finishStart));
+  assert.equal(
+    (finish.match(/cancelRequestedRef\.current \|\| stale\(\)/g) || []).length,
+    4,
+    "finishRecording 的四个检查点必须全部包含 stale 守卫",
+  );
+  assert.match(finish, /if \(!cancelRequestedRef\.current && !stale\(\)\) \{/);
+  assert.match(finish, /if \(generation === pipelineGenerationRef\.current\) \{/);
+  // B 浮窗波形：overlay webview 本地订阅 native-audio-level 直喂 levelBus，~60Hz rAF 直写
+  assert.match(app, /listen<number>\("native-audio-level", \(\{ payload \}\) => levelBus\.set\(payload\)\)/);
+  const capsule = await readFile(new URL("../src/components/CapsuleStage.tsx", import.meta.url), "utf8");
+  assert.match(capsule, /<Waveform barCount=\{13\}/);
+  assert.doesNotMatch(capsule, /Array\.from\(\{ length: 13 \}/);
+});

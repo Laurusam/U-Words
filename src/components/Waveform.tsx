@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef } from "react";
+import type { CSSProperties } from "react";
 import { levelBus } from "../lib/levelBus";
 
 const BAR_BASE = 22; // 与 CapsuleStage 录音胶囊波形同一基准：scaleY = (3 + level * amp) / 22
@@ -13,7 +14,7 @@ function barScale(level: number, index: number, barCount: number) {
 // 录音电平波形：React 只渲染固定高度的 <i>，挂载后 style 不再经 React 更新；
 // 电平经 levelBus 在 rAF 中直写 scaleY（纯合成，无 layout），静音数帧后暂停循环、
 // 电平恢复时重启。StrictMode 双挂载仅多一个订阅，cleanup 正确即无害。
-export const Waveform = memo(function Waveform({ barCount, className }: { barCount: number; className?: string }) {
+export const Waveform = memo(function Waveform({ barCount, className, initialLevel = 0, label }: { barCount: number; className?: string; initialLevel?: number; label?: string }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const root = rootRef.current;
@@ -47,7 +48,10 @@ export const Waveform = memo(function Waveform({ barCount, className }: { barCou
       cancelAnimationFrame(raf);
     };
   }, [barCount]);
-  return <div ref={rootRef} className={className}>
-    {Array.from({ length: barCount }, (_, index) => <i key={index} style={{ height: BAR_BASE + "px", transform: `scaleY(${MIN_SCALE})` }} />)}
+  return <div ref={rootRef} className={className} aria-label={label}>
+    {Array.from({ length: barCount }, (_, index) => {
+      const safe = Number.isFinite(initialLevel) ? Math.max(0, Math.min(1, initialLevel)) : 0;
+      return <i key={index} style={{ height: BAR_BASE + "px", transform: `scaleY(${barScale(safe, index, barCount).toFixed(3)})`, "--bar-i": index } as CSSProperties} />;
+    })}
   </div>;
 });

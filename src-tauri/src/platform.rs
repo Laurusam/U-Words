@@ -72,9 +72,13 @@ pub fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn paste_text(text: String, expected_pid: Option<i32>) -> Result<(), String> {
+pub fn paste_text(
+    text: String,
+    expected_pid: Option<i32>,
+    expected_key: Option<String>,
+) -> Result<(), String> {
     ensure_accessibility_access()?;
-    input_target::ensure_target(&input_target::inspect(), expected_pid)?;
+    input_target::ensure_target(&input_target::inspect(), expected_pid, expected_key.as_deref())?;
     let mut clipboard = Clipboard::new().map_err(|error| format!("初始化剪贴板失败：{error}"))?;
     let previous = clipboard.get_text().ok();
     let previous_image = if previous.is_none() {
@@ -94,7 +98,7 @@ pub fn paste_text(text: String, expected_pid: Option<i32>) -> Result<(), String>
         Key::Control
     };
     let paste_result = (|| -> Result<(), String> {
-        input_target::ensure_target(&input_target::inspect(), expected_pid)?;
+        input_target::ensure_target(&input_target::inspect(), expected_pid, expected_key.as_deref())?;
         enigo
             .key(modifier, Press)
             .map_err(|error| format!("模拟粘贴失败：{error}"))?;

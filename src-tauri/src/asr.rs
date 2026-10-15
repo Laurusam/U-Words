@@ -19,6 +19,8 @@ pub struct TranscribeRequest {
     pub sample_rate: u32,
     pub language: String,
     pub dictionary: Vec<String>,
+    #[serde(default)]
+    pub scenes: Vec<String>,
     pub model: String,
     #[serde(default)]
     pub quality: String,
@@ -119,11 +121,33 @@ fn local_language(language: &str) -> Option<&str> {
     }
 }
 
+/// 本地 Whisper 上下文提示：个人词典 + 场景术语，去重后截断到 400 字符。
+/// whisper initial_prompt 预算约 224 token，400 字符是合并后的保守上限；空则不设置提示。
+fn context_prompt(dictionary: &[String], scenes: &[String]) -> Option<String> {
+    let scene_terms = crate::scenes::terms(scenes);
+    let mut terms: Vec<String> = Vec::new();
+    for term in dictionary.iter().chain(scene_terms.iter()) {
+        let term = term.trim();
+        if !term.is_empty() && !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_string());
+        }
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let mut prompt = terms.join(", ");
+    if prompt.chars().count() > 400 {
+        prompt = prompt.chars().take(400).collect();
+    }
+    Some(prompt)
+}
+
 fn run_whisper(
     context: &WhisperContext,
     audio: &[f32],
     language: &str,
     dictionary: &[String],
+    scenes: &[String],
     model: &str,
     cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<TranscriptCandidate, String> {
@@ -139,9 +163,8 @@ fn run_whisper(
     params.set_no_timestamps(false);
     params.set_translate(false);
     params.set_language(local_language(language));
-    let dictionary_prompt = dictionary.join(", ");
-    if !dictionary_prompt.is_empty() {
-        params.set_initial_prompt(&dictionary_prompt);
+    if let Some(prompt) = context_prompt(dictionary, scenes) {
+        params.set_initial_prompt(&prompt);
     }
     state
         .full(params, audio)
@@ -238,10 +261,16 @@ pub async fn transcribe(
         }
         let audio = resample_to_16k(&request.samples, request.sample_rate);
         let wav = cloud_asr::wav_bytes(&audio).map_err(|error| error.message)?;
+        // 千问 ASR 无独立热词/上下文字段：场景术语并入既有“音频相关实体词表” system 消息下发
+        let vocabulary = [
+            request.dictionary.as_slice(),
+            crate::scenes::terms(&request.scenes).as_slice(),
+        ]
+        .concat();
         let body = cloud_asr::request_body(
             &wav,
             &request.language,
-            &request.dictionary,
+            &vocabulary,
             config.asr_enable_itn,
         );
         match cloud_asr::recognize(
@@ -305,6 +334,7 @@ pub async fn transcribe(
     let audio = resample_to_16k(&request.samples, request.sample_rate);
     let language = request.language;
     let dictionary = request.dictionary;
+    let scenes = request.scenes;
     let contexts = Arc::clone(&state.whisper_contexts);
     let execution_lock = Arc::clone(&state.whisper_execution_lock);
     let cancel=app.state::<crate::recorder::RecorderState>().cancel.lock().map_err(|_|"识别任务繁忙")?.clone();
@@ -324,7 +354,7 @@ pub async fn transcribe(
         }
         for (index, (id, path)) in paths.iter().enumerate() {
             let result = cached_whisper_context(&contexts, path)
-                .and_then(|context| run_whisper(&context, &audio, &language, &dictionary, id,cancel.clone()));
+                .and_then(|context| run_whisper(&context, &audio, &language, &dictionary, &scenes, id,cancel.clone()));
             match result {
                 Ok(candidate) => candidates.push(candidate),
                 Err(error) if index == 0 => return Err(error),
@@ -378,6 +408,23 @@ mod tests {
         assert_eq!(normalized[0], 0.0);
         assert!((normalized[1] - 1.0).abs() < 0.0001);
         assert_eq!(resample_to_16k(&[0.0, 32767.0], 8_000).len(), 4);
+    }
+
+    #[test]
+    fn scene_terms_merge_into_whisper_context_with_dedupe_and_cap() {
+        let dictionary = vec!["U-Words".into(), "终端 ".into()];
+        let scenes = vec!["code".into(), "nope".into()];
+        let prompt = context_prompt(&dictionary, &scenes).unwrap();
+        assert!(prompt.contains("U-Words"));
+        // 场景术语并入且与词典去重（词典里的“终端 ”带空格，trim 后视为同词）
+        assert!(prompt.contains("接口"));
+        assert_eq!(prompt.matches("终端").count(), 1);
+        assert!(!prompt.contains("nope"));
+        // 空词典 + 无术语场景（general）→ 不设置 initial_prompt
+        assert!(context_prompt(&[], &["general".into()]).is_none());
+        // 超长合并结果截断到 400 字符
+        let long_dictionary: Vec<String> = (0..100).map(|index| format!("词条{index:04}xxxxxxxxxx")).collect();
+        assert_eq!(context_prompt(&long_dictionary, &[]).unwrap().chars().count(), 400);
     }
 
     #[test]

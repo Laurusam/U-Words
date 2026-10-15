@@ -271,6 +271,7 @@ pub async fn transcribe_recording(
     id: String,
     language: String,
     dictionary: Vec<String>,
+    scenes: Vec<String>,
     model: String,
 ) -> Result<TranscriptionResult, String> {
     let file = path(&app, &id)?;
@@ -306,6 +307,7 @@ pub async fn transcribe_recording(
             sample_rate: rate,
             language: language.clone(),
             dictionary: dictionary.clone(),
+            scenes: scenes.clone(),
             model: model.clone(),
             quality: "fast".into(),
         };

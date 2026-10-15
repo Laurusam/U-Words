@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { OverlayCommand, OverlayResult, OverlayState } from "../types";
 import { native } from "../lib/native";
 import { diffWords } from "../lib/diff";
 import { ImageReveal } from "./ImageReveal";
+import { Waveform } from "./Waveform";
 import { animateSpring, prefersReducedMotion, SPRING_POP, SPRING_SETTLE, type SpringHandle } from "../lib/spring";
 import "./capsule.css";
 
@@ -57,12 +57,8 @@ function RecordFace({ level, onCommand }: { level: number; onCommand: (command: 
   const safe = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
   return <>
     <button type="button" className="floating-action floating-cancel" onClick={() => onCommand("cancel")} aria-label="取消录音" title="取消（Esc）"><Glyph kind="close" /></button>
-    <div className="floating-meter" aria-label="实时音量">
-      {Array.from({ length: 13 }, (_, index) => {
-        const scale = (3 + Math.max(.05, safe) * (7 + (6 - Math.abs(6 - index)) * 2)) / 22;
-        return <i key={index} style={{ height: "22px", transform: `scaleY(${scale.toFixed(3)})`, opacity: safe > .02 ? 1 : .45, "--bar-i": index } as CSSProperties} />;
-      })}
-    </div>
+    {/* 电平经 overlay webview 本地 levelBus 以 ~60Hz rAF 直写 transform；state.level 只供首帧初值与静音变暗 */}
+    <Waveform barCount={13} className={"floating-meter" + (safe > .02 ? " live" : "")} initialLevel={safe} label="实时音量" />
     <button type="button" className="floating-action floating-confirm" onClick={() => onCommand("finish")} aria-label="完成录音" title="完成"><Glyph kind="check" /></button>
   </>;
 }

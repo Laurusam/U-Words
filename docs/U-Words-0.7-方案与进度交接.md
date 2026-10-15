@@ -437,3 +437,25 @@ P0 增量：
 - work/ 下 7 个 u-words-before-*.zip（约 1.3GB，9 月 17-20 的手动备份）属用户备份，未擅自删除，待用户决定
 
 **验证**：tsc 0 错、npm test 60/60、cargo check 0 错 0 警、cargo test 纯逻辑部分（config legacy 3/3）通过；HTTP 契约类测试在沙箱内因 mock server 端口 PermissionDenied 固有失败（test_support.rs:10），与本次改动无关。构建产物 U-Words.app 0.8.0 签名通过（SIGN-OK），已装入 /Applications 并再次验签。DMG 分发包已由用户终端 `npm run tauri:dmg` 重打完成（U-Words_0.8.0_arm64.dmg，hdiutil verify 校验 VALID；沙箱内 tauri:build 的 DMG 段仍因 Apple Events 授权失败，属已知限制）。全部改动未提交（按用户指示）。
+
+### 12.11 审计收尾轮：发现 5/6/7 + 会话竞态 + 场景体系接通（2026-10-15）
+
+外部质量审计（§12.8 同一份 7 项发现）经两轮代码探查复核：发现 1–4 已在 §12.8 修复且在位；本轮处理剩余项（用户确认范围：发现 5/6/7 + 转录上下文优化；原生动效路线 B 另立分支不在本轮）。改动未提交（按用户指示）。
+
+**A 遗留健壮性**：recordUsage/resetUsageStats 的 `persist("usage")` 移出 localStorage try（对齐 storeHistory 的 SQLite-first 模式）；新增 `pipelineGenerationRef` 会话代数守卫——startRecording 单点递增，finishRecording 四检查点（capture.stop 后/ASR 返回后/模型返回后/插入前）+ catch + finally 全部收窄为"跨代静默丢弃且不触碰新会话浮窗"，堵住"cancelCurrent 提前置 false busy → 新录音重置取消旗标 → 迟到结果污染新会话"的窄竞态。
+
+**B 浮窗波形 60Hz（发现 5）**：OverlayApp 直接 `listen("native-audio-level")` 喂 overlay webview 本地 levelBus 实例；RecordFace 的 13 根手写 bar 替换为 `<Waveform barCount={13} initialLevel label>`（Waveform 新增 initialLevel/--bar-i/label props，SSR 初值用 barScale 而非 MIN_SCALE）；10Hz state.level 降级为初值 + `live` 类（静音 .45 变暗移入 CSS）。dev 预览已验证 13 bar 渲染与 rAF 循环。
+
+**C 场景体系接通（发现 6）+ 转录上下文**：
+- 新增 `src/lib/scenes.ts`（唯一来源：general/code/email/notes/markdown + normalizeScenes）与 `src-tauri/src/scenes.rs`（id→提示段/候选术语映射，`prompt()` 未知 id 忽略、`terms()` 顺序去重；无 label 字段避免 dead_code）
+- 渲染链：RenderRequest 增 `scenes`（serde default，新旧混跑不炸）；system_prompt 三个分支原 app_hint 槽位改放 scene_hint；前端 scenesRef 在 startRecording 随 getInputTarget 一起冻结
+- ASR 链：TranscribeRequest/recorder transcribe_recording 增 scenes 透传；asr.rs 新 `context_prompt()`（词典+场景术语去重、400 字符截断）喂 whisper initial_prompt；千问云侧无独立热词字段（已核实 schema），场景术语并入既有"音频相关实体词表" system 消息
+- 死配置清理：llm.rs 删 app_hint + app_name 字段（应用名不再发云端，行为变化）；前端删 addProfile/removeProfile/profileApp/profilePreset/normalizeAppName/ConfirmAction remove-profile/SettingsView 相关 props 与"当前应用"readout/profile-form/profile-list UI 及对应 CSS；resolvePreset 改无参；`AppConfig.appProfiles` 字段两侧保留为惰性存量数据
+- 设置页新增 ScenePicker（原应用规则区域原位替换）：先读回最新全量 tools 配置再 normalizeTools patch（不照抄 Onboarding 的 DEFAULT_TOOLS 展开，避免重置 onboardingDone）→ save + `tools-config` 广播；Onboarding 改用共享 SCENES
+- 范围边界：工具会话（context_tools tools_chat）有独立 prompt 路径，本轮不接场景
+
+**D 插入目标身份校验（发现 7）**：input_target.rs macOS target_key 弃用 CFHash（AXUIElement 跨探测无稳定契约，直接比较会产生不可控假阴性——continuity 的 targetKey 全等匹配因此现网可能一直静默失效，本次顺带修复），改为稳定属性组 `pid|AXWindow.AXTitle|role|AXTitle/AXDescription`（不取 AXValue；三部件全空→None 退化 PID-only）；ensure_target 增 expected_key 三参比较（双 Some 不等拒绝/Some-None 拒绝/任一 None 退化）；paste_text 签名增 expected_key 两处校验传入；tools_apply_selection 两调用点传 None（已有更严的 same_selection 复核）；前端 pasteText 传 inputTargetRef.targetKey。误拒方向可接受（降级复制卡）。
+
+**测试与验证**：tsc 0 错；npm test 65/65（新增：waveform 13-bar 初值 SSR、overlay A/B 契约、test-scenes.mjs 3 例——Rust/TS 场景目录一致性、normalizeScenes、全链路接线 + 死配置移除契约）；cargo check 0 错 0 警；cargo test 40 过（新增 scenes 2、llm scene_hint 1、asr context_prompt 1、input_target 身份 4 并更新 1）+ 6 失败为既有沙箱 TcpListener 基线（与改动前清单完全一致）；vite build 通过；dev 预览浮窗五态 + 13 bar 渲染确认。
+
+**真机待验证**：A2 竞态（工具语音结束瞬间 Esc → 立即再录，无 error 浮窗）；B 浮窗波形灵敏度 ≈ 主窗、静音自动暂停；C 场景改选后云端请求含场景段且不含应用名、口述技术内容术语保持；D 同应用切文档/标签拒插（降级复制卡）、同输入框放行、连续口述 continuity 开始命中。原生动效路线 B（NSPanel+CALayer / Windows Composition）轮廓见计划文档，启动条件：本轮 B 实测仍不达标才立项，分支 `feat/native-effects`。

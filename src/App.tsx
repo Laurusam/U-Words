@@ -9,6 +9,7 @@ import type { Capture } from "./lib/nativeAudio";
 import { native } from "./lib/native";
 import { invoke } from "@tauri-apps/api/core";
 import { ACTIONS, toolsApi } from "./lib/contextTools";
+import { normalizeScenes } from "./lib/scenes";
 import type { ActionId, SelectionSnapshot } from "./lib/contextTools";
 import { useContextTools } from "./lib/useContextTools";
 import { ContextTools } from "./components/ContextTools";
@@ -26,13 +27,13 @@ import { Waveform } from "./components/Waveform";
 import { CapsuleStage, resolveStage } from "./components/CapsuleStage";
 import { OverlayPreview } from "./components/OverlayPreview";
 import { AsrLanguageSelect } from "./components/AsrLanguageSelect";
+import { ScenePicker } from "./components/ScenePicker";
 import { PlanReviewView } from "./components/PlanReviewView";
 import type { PlanReviewSession } from "./components/PlanReviewView";
 import appIcon from "../src-tauri/icons/icon.png";
 import { OVERLAY_COMMAND_EVENT, OVERLAY_IMAGE_EVENT, OVERLAY_READY_EVENT, OVERLAY_STATE_EVENT } from "./types";
 import type {
   AppConfig,
-  AppProfile,
   AppStatus,
   DictationMode,
   HistoryItem,
@@ -141,8 +142,7 @@ type ConfirmAction =
   | { kind: "delete-history"; id: string }
   | { kind: "clear-history" }
   | { kind: "reset-stats" }
-  | { kind: "remove-word"; word: string }
-  | { kind: "remove-profile"; appName: string };
+  | { kind: "remove-word"; word: string };
 
 function migrateConfig(config: AppConfig): AppConfig {
   return {
@@ -253,10 +253,6 @@ function formatShortcut(shortcut: string) {
   return shortcut.replace("CommandOrControl", "⌘/Ctrl").replaceAll("+", " ");
 }
 
-function normalizeAppName(name: string) {
-  return name.trim().toLocaleLowerCase();
-}
-
 function presetLabel(id: PromptPresetId) {
   return RENDER_PRESETS.find((preset) => preset.id === id)?.label || "通用润色";
 }
@@ -311,6 +307,8 @@ function MainApp() {
   const planGenerationRef = useRef(0);
   const planBusyRef = useRef(false);
   const inputTargetRef = useRef<{ editable: boolean; appPid: number | null; reason: string; targetKey?: string; self?: boolean } | null>(null);
+  // 录音开始时冻结的场景选择：随识别与整理请求下发（识别术语 + 整理提示段）
+  const scenesRef = useRef<string[]>([]);
   const previousDictationRef = useRef<ContinuityEntry | null>(null);
   const pendingPreviousRef = useRef<string | undefined>(undefined);
   const recordingTriggerRef = useRef(new RecordingTrigger());
@@ -343,8 +341,6 @@ function MainApp() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
-  const [profileApp, setProfileApp] = useState("");
-  const [profilePreset, setProfilePreset] = useState<PromptPresetId>("chat");
   const isTauriRuntime = hasTauriRuntime();
   const voiceQuestionRef = useRef<string | null>(null);
   const voiceModeLabelRef = useRef("");
@@ -396,6 +392,8 @@ function MainApp() {
   const recordingRef = useRef(false);
   const pipelineBusyRef = useRef(false);
   const cancelRequestedRef = useRef(false);
+  // 会话代数：startRecording 单点递增；旧 finishRecording 的检查点与 finally 据此失效，迟到回包不污染新会话
+  const pipelineGenerationRef = useRef(0);
   const hotkeyRef = useRef("");
   const editHotkeyRef = useRef("");
   const escapeHotkeyRef = useRef("");
@@ -512,24 +510,28 @@ function MainApp() {
     };
     usageStatsRef.current = next;
     setUsageStats(next);
+    // SQLite 是桌面端权威存储：独立落盘，不因浏览器存储配额异常被跳过
+    if (isTauriRuntime) {
+      void persist("usage", next).catch((error) => setStatusMessage("统计数据库保存失败：" + String(error)));
+    }
     try {
       localStorage.setItem(USAGE_STATS_KEY, JSON.stringify(next));
-      if (isTauriRuntime) {
-        void persist("usage", next).catch((error) => setStatusMessage("统计数据库保存失败：" + String(error)));
-      }
     } catch {
-      if (notifyOnError) setStatusMessage("累计统计保存失败，但本次文字仍已完成");
+      // 桌面端 localStorage 仅作镜像，失败可忽略；浏览器预览仍需提示
+      if (!isTauriRuntime && notifyOnError) setStatusMessage("累计统计保存失败，但本次文字仍已完成");
     }
   };
 
   const resetUsageStats = () => {
     usageStatsRef.current = EMPTY_USAGE_STATS;
     setUsageStats(EMPTY_USAGE_STATS);
+    if (isTauriRuntime) {
+      void persist("usage", EMPTY_USAGE_STATS).catch((error) => setStatusMessage("统计数据库重置失败：" + String(error)));
+    }
     try {
       localStorage.setItem(USAGE_STATS_KEY, JSON.stringify(EMPTY_USAGE_STATS));
-      if(isTauriRuntime)void persist("usage",EMPTY_USAGE_STATS).catch(error=>setStatusMessage("统计数据库重置失败："+String(error)));
     } catch {
-      // The in-memory state is still reset for this session.
+      // 桌面端 localStorage 仅作镜像，失败可忽略；内存态本轮已重置
     }
     setConfirmAction(null);
     setStatusMessage("累计统计已重置");
@@ -593,7 +595,7 @@ function MainApp() {
     if (patch.historyRetention !== undefined) storeHistory(historyRef.current, next.historyRetention);
   };
 
-  const resolvePreset = (_appName: string) => config.defaultPreset;
+  const resolvePreset = () => config.defaultPreset;
 
   // 返回 false = 早退（占用/权限/方案检查），录音未真正开始；调用方据此回收已建的会话
   const startRecording = async (nextOperation: OperationMode = "dictate", nextSelectedText = "", fromHold = false): Promise<boolean> => {
@@ -606,11 +608,16 @@ function MainApp() {
       return false;
     }
     pipelineBusyRef.current = true;
+    pipelineGenerationRef.current += 1;
     cancelRequestedRef.current = false;
     void registerEscapeShortcut();
     try {
       const appName = await native.getActiveApp().catch(() => "");
       inputTargetRef.current = await native.getInputTarget().catch(() => ({ editable: false, appPid: null, reason: "无法确认输入光标，请复制文字" }));
+      scenesRef.current = await toolsApi
+        .config()
+        .then((tools) => normalizeScenes(tools.scenes))
+        .catch(() => scenesRef.current);
       pendingPreviousRef.current = nextOperation === "dictate" && config.mode === "smart" && inputTargetRef.current.editable
         ? previousContext(previousDictationRef.current, inputTargetRef.current.targetKey, "", Date.now(), config.linkPreviousDictation) : undefined;
       if (!pendingPreviousRef.current) previousDictationRef.current = null;
@@ -739,10 +746,13 @@ function MainApp() {
     const recordingClock = recordingClockRef.current;
     const recordingStoppedAt = Date.now();
     const processingStartedPerf = performance.now();
+    const generation = pipelineGenerationRef.current;
+    // 跨代 = 期间已有新录音启动：本会话迟到回包一律静默丢弃，且不得触碰属于新会话的浮窗
+    const stale = () => generation !== pipelineGenerationRef.current;
     try {
       const audio = await capture.stop();
-      if (cancelRequestedRef.current) {
-        hideFloatingOverlay();
+      if (cancelRequestedRef.current || stale()) {
+        if (!stale()) hideFloatingOverlay();
         return;
       }
       if ((audio.sampleCount ?? audio.samples.length) < audio.sampleRate * 0.1) {
@@ -760,6 +770,7 @@ function MainApp() {
             id: audio.recordingId,
             language: config.language,
             dictionary: config.dictionary,
+            scenes: scenesRef.current,
             model: config.activeModel,
           })
         : await native.transcribe({
@@ -767,14 +778,15 @@ function MainApp() {
             sampleRate: audio.sampleRate,
             language: config.language,
             dictionary: config.dictionary,
+            scenes: scenesRef.current,
             model: config.activeModel,
             quality: config.recognitionQuality,
           });
       const transcript = transcription.text;
       const transcribedAt = Date.now();
       const asrMs = Math.round(performance.now() - transcribeStartedPerf);
-      if (cancelRequestedRef.current) {
-        hideFloatingOverlay();
+      if (cancelRequestedRef.current || stale()) {
+        if (!stale()) hideFloatingOverlay();
         return;
       }
       setRawText(transcript);
@@ -805,7 +817,7 @@ function MainApp() {
       setStatusMessage(currentOperation === "edit" ? "正在生成编辑预览…" : config.mode === "smart" ? "正在自动标点和整理段落…" : "正在准备文本…");
       const renderStartedAt = Date.now();
       const renderStartedPerf = performance.now();
-      const preset = resolvePreset(currentApp);
+      const preset = resolvePreset();
       const currentTarget = pendingPreviousRef.current ? await native.getInputTarget().catch(() => null) : null;
       const context = currentOperation === "dictate" && config.mode === "smart" && currentTarget?.targetKey === inputTargetRef.current?.targetKey
         ? previousContext(previousDictationRef.current, currentTarget?.targetKey, transcript, Date.now(), configRef.current.linkPreviousDictation) : undefined;
@@ -821,7 +833,7 @@ function MainApp() {
         temperature: config.llmTemperature,
         operation: currentOperation,
         preset,
-        appName: currentApp,
+        scenes: scenesRef.current,
         selectedText: currentOperation === "edit" ? currentSelectedText : undefined,
         previousText: context,
         candidates: transcription.candidates,
@@ -839,8 +851,8 @@ function MainApp() {
       result = { ...result, text: finalizeDictationText(result.text) };
       const renderedAt = Date.now();
       const renderMs = Math.round(performance.now() - renderStartedPerf);
-      if (cancelRequestedRef.current) {
-        hideFloatingOverlay();
+      if (cancelRequestedRef.current || stale()) {
+        if (!stale()) hideFloatingOverlay();
         return;
       }
       setRenderedText(result.text);
@@ -870,8 +882,8 @@ function MainApp() {
         setOverlayResult({ action: "翻译", app: currentApp, source: transcript, text: result.text, writeStatus: "copy" });
         needsPreview = false;
       } else if (config.autoInsert && result.text.trim()) {
-        if (cancelRequestedRef.current) {
-          hideFloatingOverlay();
+        if (cancelRequestedRef.current || stale()) {
+          if (!stale()) hideFloatingOverlay();
           return;
         }
         if (inputTargetRef.current?.self) {
@@ -890,7 +902,7 @@ function MainApp() {
           needsPreview = true;
         } else {
           try {
-            await native.pasteText(result.text, inputTargetRef.current.appPid);
+            await native.pasteText(result.text, inputTargetRef.current.appPid, inputTargetRef.current.targetKey ?? null);
             insertedAt = Date.now();
           } catch (error) {
             warning = "文本已生成，但自动插入失败：" + String(error);
@@ -950,17 +962,20 @@ function MainApp() {
       if (needsPreview) showFloatingOverlay(true);
       setStatusMessage(warning || (needsPreview ? "自动插入已关闭，请复制文字" : `已发送粘贴 · 识别 ${formatDuration(asrMs)} · 整理 ${formatDuration(renderMs)}`));
     } catch (error) {
-      previousDictationRef.current = null;
-      if (!cancelRequestedRef.current) {
+      if (!cancelRequestedRef.current && !stale()) {
+        previousDictationRef.current = null;
         setStatus("error");
         setStatusMessage(String(error));
         showFloatingOverlay();
       }
     } finally {
-      pipelineBusyRef.current = false;
-      recordingClockRef.current = null;
-      levelRef.current = 0; levelBus.set(0);
-      if (!resultPreviewRef.current && !overlayResultRef.current) void unregisterEscapeShortcut();
+      // 跨代时清理权属于新会话：这里什么都不动
+      if (generation === pipelineGenerationRef.current) {
+        pipelineBusyRef.current = false;
+        recordingClockRef.current = null;
+        levelRef.current = 0; levelBus.set(0);
+        if (!resultPreviewRef.current && !overlayResultRef.current) void unregisterEscapeShortcut();
+      }
     }
   };
 
@@ -1422,15 +1437,6 @@ function MainApp() {
     setStatusMessage("词典已导出");
   };
 
-  const addProfile = () => {
-    const appName = profileApp.trim();
-    if (!appName) return;
-    const profiles = config.appProfiles.filter((profile) => normalizeAppName(profile.appName) !== normalizeAppName(appName));
-    saveConfig({ appProfiles: [...profiles, { appName, preset: profilePreset }] });
-    setProfileApp("");
-    setStatusMessage(`已保存 ${appName} 的渲染风格`);
-  };
-
   const copyText = async (text: string) => {
     if (!text) return;
     try {
@@ -1484,12 +1490,6 @@ function MainApp() {
     setStatusMessage("词条已移除");
   };
 
-  const removeProfile = (appName: string) => {
-    saveConfig({ appProfiles: config.appProfiles.filter((profile) => profile.appName !== appName) });
-    setConfirmAction(null);
-    setStatusMessage("应用级风格已移除");
-  };
-
   const confirm = () => {
     if (!confirmAction) return;
     if (confirmAction.kind === "delete-history") deleteHistoryItem(confirmAction.id);
@@ -1500,7 +1500,6 @@ function MainApp() {
     }
     if (confirmAction.kind === "reset-stats") resetUsageStats();
     if (confirmAction.kind === "remove-word") removeWord(confirmAction.word);
-    if (confirmAction.kind === "remove-profile") removeProfile(confirmAction.appName);
   };
 
   const dismissResult = () => {
@@ -1673,9 +1672,6 @@ function MainApp() {
               microphones={microphones}
               micState={micState}
               accessibilityTrusted={accessibilityTrusted}
-              activeApp={activeApp}
-              profileApp={profileApp}
-              profilePreset={profilePreset}
               onConfigChange={saveConfig}
               onProviderPreset={chooseProviderPreset}
               onModelActivate={activateModel}
@@ -1704,10 +1700,6 @@ function MainApp() {
               onTestMicrophone={testMicrophone}
               onRefreshAccessibility={() => void refreshAccessibilityStatus()}
               onOpenAccessibilitySettings={() => void openAccessibilitySettings()}
-              onProfileAppChange={setProfileApp}
-              onProfilePresetChange={setProfilePreset}
-              onAddProfile={addProfile}
-              onRemoveProfile={(appName) => setConfirmAction({ kind: "remove-profile", appName })}
             />
           </>
         )}
@@ -1719,7 +1711,7 @@ function MainApp() {
       {confirmAction && (
         <ConfirmDialog
           title={confirmAction.kind === "clear-history" ? "清空全部历史？" : confirmAction.kind === "reset-stats" ? "重置累计统计？" : confirmAction.kind === "delete-history" ? "删除这条记录？" : confirmAction.kind === "remove-word" ? "移除这个词条？" : "移除应用级风格？"}
-          message={confirmAction.kind === "clear-history" ? "删除后无法恢复，建议先导出需要保留的内容。" : confirmAction.kind === "reset-stats" ? "累计字数和使用次数会归零，但历史文本不会被删除。" : confirmAction.kind === "remove-word" ? `将从个人词典中移除“${confirmAction.word}”。` : confirmAction.kind === "remove-profile" ? `将移除 ${confirmAction.appName} 的专属渲染规则。` : "这条记录会从本机历史中删除。"}
+          message={confirmAction.kind === "clear-history" ? "删除后无法恢复，建议先导出需要保留的内容。" : confirmAction.kind === "reset-stats" ? "累计字数和使用次数会归零，但历史文本不会被删除。" : confirmAction.kind === "remove-word" ? `将从个人词典中移除“${confirmAction.word}”。` : "这条记录会从本机历史中删除。"}
           onCancel={() => setConfirmAction(null)}
           onConfirm={confirm}
         />
@@ -1845,7 +1837,7 @@ function DictionaryView({ words, newWord, editingWord, editingWordValue, onChang
   return <div className="page narrow-page"><section className="intro-block"><span className="section-kicker">PERSONAL VOCABULARY</span><h2>让它听懂你的世界。</h2><p>加入人名、产品名、专业术语或常用表达。它们会提供给所选 ASR 和文字整理模型。</p></section><div className="add-word"><input value={newWord} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") onAdd(); }} placeholder="输入一个词，例如：U-Words" /><button className="primary-button small" onClick={onAdd}><span>✓</span>添加</button></div><div className="dictionary-actions"><label className="file-button"><span>↓</span>导入 CSV<input type="file" accept=".csv,.txt" onChange={(event: ChangeEvent<HTMLInputElement>) => { void onImport(event.target.files?.[0] || null); event.target.value = ""; }} /></label><button className="quiet-button" onClick={onExport} disabled={!words.length}>导出 CSV</button><span>{words.length} 个词条</span></div><div className="word-list">{words.length === 0 ? <div className="empty-card"><span>⌘</span><p>词典还是空的</p><small>从一个你经常说错的词开始。</small></div> : words.map((word) => editingWord === word ? <div className="word-row editing" key={word}><input value={editingWordValue} onChange={(event) => onEditingValueChange(event.target.value)} autoFocus /><div><button className="icon-action" onClick={onCancelEdit} aria-label="取消编辑">×</button><button className="icon-action confirm" onClick={onSaveEdit} aria-label="保存词条">✓</button></div></div> : <div className="word-row" key={word}><span>{word}</span><div><button className="quiet-button" onClick={() => onEdit(word)}>编辑</button><button className="icon-action danger" onClick={() => onRemove(word)} aria-label={`移除 ${word}`}>×</button></div></div>)}</div></div>;
 }
 
-function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiKeyInput, hotkeyError, microphones, micState, accessibilityTrusted, activeApp, profileApp, profilePreset, onConfigChange, onProviderPreset, onModelActivate, onHotkey, onApiKeyChange, onSaveApiKey, onRefreshMicrophones, onTestMicrophone, onRefreshAccessibility, onOpenAccessibilitySettings, onProfileAppChange, onProfilePresetChange, onAddProfile, onRemoveProfile }: { config: AppConfig; cloudSettings: ReactNode; model: ModelStatus; modelBusy: string | null; apiKeySet: boolean; apiKeyInput: string; hotkeyError: string; microphones: MediaDeviceInfo[]; micState: MicState; accessibilityTrusted: boolean | null; activeApp: string; profileApp: string; profilePreset: PromptPresetId; onConfigChange: (patch: Partial<AppConfig>) => void; onProviderPreset: (name: string) => void; onModelActivate: (model: ModelOption) => void; onHotkey: (event: ReactKeyboardEvent<HTMLInputElement>, field: "hotkey" | "editHotkey") => void; onApiKeyChange: (value: string) => void; onSaveApiKey: () => void; onRefreshMicrophones: () => void; onTestMicrophone: () => void; onRefreshAccessibility: () => void; onOpenAccessibilitySettings: () => void; onProfileAppChange: (value: string) => void; onProfilePresetChange: (value: PromptPresetId) => void; onAddProfile: () => void; onRemoveProfile: (appName: string) => void }) {
+function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiKeyInput, hotkeyError, microphones, micState, accessibilityTrusted, onConfigChange, onProviderPreset, onModelActivate, onHotkey, onApiKeyChange, onSaveApiKey, onRefreshMicrophones, onTestMicrophone, onRefreshAccessibility, onOpenAccessibilitySettings }: { config: AppConfig; cloudSettings: ReactNode; model: ModelStatus; modelBusy: string | null; apiKeySet: boolean; apiKeyInput: string; hotkeyError: string; microphones: MediaDeviceInfo[]; micState: MicState; accessibilityTrusted: boolean | null; onConfigChange: (patch: Partial<AppConfig>) => void; onProviderPreset: (name: string) => void; onModelActivate: (model: ModelOption) => void; onHotkey: (event: ReactKeyboardEvent<HTMLInputElement>, field: "hotkey" | "editHotkey") => void; onApiKeyChange: (value: string) => void; onSaveApiKey: () => void; onRefreshMicrophones: () => void; onTestMicrophone: () => void; onRefreshAccessibility: () => void; onOpenAccessibilitySettings: () => void }) {
   return <div className="page settings-page">
     <SettingsGroup title="外观" hint="黑白界面，可在浅色与高级灰深色模式之间切换；选择会自动保存。">
       <div className="setting-row"><div><strong>界面模式</strong><small>{config.theme === "dark" ? "高级灰深色" : "黑白浅色"}</small></div><div className="segmented small-segmented"><button className={config.theme === "light" ? "selected" : ""} onClick={() => onConfigChange({ theme: "light" })}>浅色</button><button className={config.theme === "dark" ? "selected" : ""} onClick={() => onConfigChange({ theme: "dark" })}>深色</button></div></div>
@@ -1874,11 +1866,9 @@ function SettingsView({ config, cloudSettings, model, modelBusy, apiKeySet, apiK
       <div className="setting-row"><div><strong>开机自动启动</strong><small>后台常驻后可以直接使用全局快捷键；关闭窗口只会隐藏应用</small></div><Toggle value={config.launchAtLogin} onChange={() => onConfigChange({ launchAtLogin: !config.launchAtLogin })} /></div>
       {hotkeyError && <div className="error-note">{hotkeyError}</div>}
     </SettingsGroup>
-    <SettingsGroup title="渲染风格" hint="默认风格作用于所有应用；配置应用名称后，U-Words 会按当前前台应用匹配专属风格。">
+    <SettingsGroup title="渲染风格与场景" hint="默认风格决定整体表达基线；使用场景为识别与整理提供术语和表达习惯，不根据当前应用改变风格。">
       <div className="setting-row stacked"><label>默认风格</label><select value={config.defaultPreset} onChange={(event) => onConfigChange({ defaultPreset: event.target.value as PromptPresetId })}>{RENDER_PRESETS.map((preset) => <option value={preset.id} key={preset.id}>{preset.label} · {preset.description}</option>)}</select></div>
-      <div className="setting-row stacked"><label>当前应用</label><div className="context-readout">{activeApp || "录音时自动识别"}</div></div>
-      <div className="profile-form"><input value={profileApp} onChange={(event) => onProfileAppChange(event.target.value)} placeholder="应用名称，例如：Visual Studio Code" /><select value={profilePreset} onChange={(event) => onProfilePresetChange(event.target.value as PromptPresetId)}>{RENDER_PRESETS.map((preset) => <option value={preset.id} key={preset.id}>{preset.label}</option>)}</select><button className="outline-button" onClick={onAddProfile}><span>✓</span>添加规则</button></div>
-      {config.appProfiles.length > 0 && <div className="profile-list">{config.appProfiles.map((profile: AppProfile) => <div className="profile-row" key={profile.appName}><span>{profile.appName}</span><span className="history-tag">{presetLabel(profile.preset)}</span><button className="icon-action danger" onClick={() => onRemoveProfile(profile.appName)} aria-label={`移除 ${profile.appName}`}>×</button></div>)}</div>}
+      <ScenePicker />
     </SettingsGroup>
     <SettingsGroup title="大模型渲染" hint="仅在智能渲染、翻译或选区编辑时调用。API Key 使用系统凭据库保存，不写入前端或普通配置文件。">
       {config.llmUseAsrToken ? <div className="setting-note">当前使用千问旗舰模型 qwen3.8-max（官方最新最强，文本与图片理解一体），复用所选地域的百炼 Token，无需填写模型。识别与文字整理分别计费。关闭上方“同一 Token 用于文字整理”即可恢复原服务商配置。</div> : <>
@@ -2035,6 +2025,7 @@ function OverlayApp() {
     document.body.classList.add("overlay-window");
     let unlisten: (() => void) | undefined;
     let unlistenImage: (() => void) | undefined;
+    let unlistenLevel: (() => void) | undefined;
     void listen<OverlayState>(OVERLAY_STATE_EVENT, ({ payload }) => setState(payload))
       .then((dispose) => {
         unlisten = dispose;
@@ -2047,9 +2038,17 @@ function OverlayApp() {
         unlistenImage = dispose;
       })
       .catch(() => undefined);
+    // 电平直通车：native-audio-level 由 Rust 广播到所有 webview，overlay 的 levelBus 实例
+    // 在本地被直接喂给 → Waveform 的 rAF 循环 ~60Hz 直写 transform，不经 10Hz 跨窗状态帧
+    void listen<number>("native-audio-level", ({ payload }) => levelBus.set(payload))
+      .then((dispose) => {
+        unlistenLevel = dispose;
+      })
+      .catch(() => undefined);
     return () => {
       unlisten?.();
       unlistenImage?.();
+      unlistenLevel?.();
       document.documentElement.classList.remove("overlay-window");
       document.body.classList.remove("overlay-window");
     };

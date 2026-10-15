@@ -2,15 +2,8 @@ import { useEffect, useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { DEFAULT_TOOLS, toolsApi } from "../lib/contextTools";
 import { native } from "../lib/native";
+import { SCENES } from "../lib/scenes";
 import type { AppConfig } from "../types";
-
-const SCENES: Array<[string, string]> = [
-  ["general", "日常沟通"],
-  ["code", "编程与技术"],
-  ["email", "商务办公"],
-  ["notes", "会议与学习"],
-  ["markdown", "内容创作"],
-];
 
 export function Onboarding({
   config,
@@ -58,7 +51,7 @@ export function Onboarding({
           <>
             <p>场景用于术语与表达习惯，不根据当前应用改变风格</p>
             <div className="scene-options">
-              {SCENES.map(([id, label]) => (
+              {SCENES.map(({ id, label }) => (
                 <button
                   className={scenes.includes(id) ? "selected" : ""}
                   key={id}

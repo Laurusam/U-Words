@@ -5,7 +5,7 @@
   "description": "A lightweight local voice-to-text desktop app.",
   "type": "module",
   "scripts": {
-    "test": "node --test scripts/test-config-queue.mjs scripts/test-overlay.mjs scripts/test-diff.mjs scripts/test-waveform.mjs scripts/test-macos-bundle.mjs scripts/test-audio.mjs scripts/test-plan-review.mjs scripts/test-languages.mjs scripts/test-text-output.mjs scripts/test-recording-flow.mjs scripts/test-context-tools.mjs scripts/test-self-insert.mjs",
+    "test": "node --test scripts/test-config-queue.mjs scripts/test-overlay.mjs scripts/test-diff.mjs scripts/test-waveform.mjs scripts/test-macos-bundle.mjs scripts/test-audio.mjs scripts/test-plan-review.mjs scripts/test-languages.mjs scripts/test-text-output.mjs scripts/test-recording-flow.mjs scripts/test-context-tools.mjs scripts/test-self-insert.mjs scripts/test-scenes.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview",

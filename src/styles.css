@@ -230,15 +230,9 @@ h1 { font-size: 24px; letter-spacing: -.045em; margin-top: 8px; }
 .model-row strong { display: block; color: var(--text-soft); font-size: 12px; }
 .model-row small { display: block; color: var(--faint); font-size: 10px; margin-top: 5px; line-height: 1.5; }
 .setting-row .inline-field select { min-width: 155px; }
-.context-readout { color: var(--text-dim); background: var(--panel-inset); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font-size: 11px; }
-.profile-form { display: grid; grid-template-columns: 1fr 130px auto; gap: 8px; padding: 14px 18px; border-top: 1px solid var(--line); }
-.profile-form input { min-width: 0; color: var(--text-soft); background: var(--panel-inset); border: 1px solid var(--line); border-radius: 7px; outline: none; padding: 9px 10px; font-size: 11px; }
-.profile-form input:focus { border-color: rgb(var(--accent-rgb) / .4); }
-.profile-form select { min-width: 0; }
-.profile-list { border-top: 1px solid var(--line); }
-.profile-row { display: flex; align-items: center; gap: 10px; padding: 11px 18px; border-bottom: 1px solid var(--line); color: var(--text-soft); font-size: 11px; }
-.profile-row > span:first-child { flex: 1; }
-.profile-row .icon-action { margin-left: 2px; }
+/* 场景多选（ScenePicker）；.scene-options 基础样式在 context-tools.css */
+.scene-picker .scene-options button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--text-soft); font-size: 12px; }
+.scene-picker .scene-options button.selected { border-color: var(--text); }
 
 .action-overlay { position: fixed; z-index: 20; right: 26px; bottom: 24px; min-width: 355px; max-width: 520px; display: flex; align-items: center; gap: 12px; padding: 12px 13px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 13px; box-shadow: 0 16px 55px rgba(0,0,0,.42), 0 0 0 1px rgba(0,0,0,.25); backdrop-filter: blur(16px); }
 .recording-overlay { border-color: rgb(var(--accent-rgb) / .3); }
@@ -277,7 +271,8 @@ body.overlay-window #root { width: 100%; height: 100%; background: transparent; 
 .floating-action svg, .floating-result-mark svg { display: block; width: 18px; height: 18px; }
 /* 录音胶囊音量条（CapsuleStage RecordFace）；壳样式见 capsule.css */
 .floating-meter { flex: 1; min-width: 0; height: 26px; display: flex; align-items: center; justify-content: center; gap: 2px; }
-.floating-meter i { width: 2px; min-height: 3px; border-radius: 5px; background: var(--accent); box-shadow: none; }
+.floating-meter i { width: 2px; min-height: 3px; border-radius: 5px; background: var(--accent); box-shadow: none; opacity: .45; }
+.floating-meter.live i { opacity: 1; }
 .floating-action { appearance: none; box-sizing:border-box; padding:0; margin:0; width: 28px; height: 28px; flex: 0 0 28px; display: grid; place-items: center; justify-self: center; border-radius: 50%; font-size: 19px; line-height: 1; transition: transform .12s ease, background .12s ease; }
 .floating-action:hover { transform: scale(1.06); }
 .floating-cancel { color: var(--text-soft); background: var(--panel-raised); border: 1px solid var(--line-strong); font-weight: 400; }
@@ -313,7 +308,6 @@ body.overlay-window #root { width: 100%; height: 100%; background: transparent; 
 @media (max-width: 760px) {
   .action-overlay { right: 14px; bottom: 14px; left: 14px; min-width: 0; }
   .history-toolbar, .intro-row { align-items: stretch; flex-direction: column; }
-  .profile-form { grid-template-columns: 1fr; }
   .text-columns { grid-template-columns: 1fr; }
 }
 

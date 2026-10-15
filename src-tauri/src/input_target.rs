@@ -63,14 +63,27 @@ pub fn focus_is_self() -> bool {
     false
 }
 
-pub fn ensure_target(target: &InputTarget, expected_pid: Option<i32>) -> Result<(), String> {
+pub fn ensure_target(
+    target: &InputTarget,
+    expected_pid: Option<i32>,
+    expected_key: Option<&str>,
+) -> Result<(), String> {
     if !target.editable {
         return Err(target.reason.clone());
     }
     if expected_pid.is_some() && expected_pid != target.app_pid {
         return Err("目标应用已切换，文字已保留，请复制后粘贴".into());
     }
-    Ok(())
+    match (expected_key, target.target_key.as_deref()) {
+        // 两侧都拿到稳定身份：不一致说明输入位置已变（同应用内切换文档/标签页/输入框）
+        (Some(want), Some(now)) if want != now => {
+            Err("输入位置已变化，文字已保留，请复制后粘贴".into())
+        }
+        // 录音时有身份、粘贴时探测退化拿不到：宁可拒绝（降级复制卡），不冒误插风险
+        (Some(_), None) => Err("无法确认当前输入位置，文字已保留，请复制后粘贴".into()),
+        // 任一侧无身份：退化为既有 PID-only 行为
+        _ => Ok(()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -154,7 +167,6 @@ mod macos {
         fn CFBooleanGetTypeID() -> usize;
         fn CFBooleanGetValue(value: Ref) -> u8;
         fn CFRelease(value: Ref);
-        fn CFHash(value: Ref) -> usize;
     }
     struct Owned(Ref);
     impl Drop for Owned {
@@ -266,9 +278,29 @@ mod macos {
                 editable: true,
                 app_pid: Some(pid),
                 reason: "检测到可编辑输入框".into(),
-                // Metadata-only best-effort identity, not proof the document is unchanged.
-                target_key: attribute(focus.0, "AXWindow")
-                    .map(|window| format!("{pid}:{}:{}", CFHash(window.0), CFHash(focus.0))),
+                // 稳定身份组：pid + 窗口标题 + 焦点元素 role + 元素标题/描述。
+                // CFHash 对 AXUIElement 跨两次独立探测无稳定契约（按指针散列实现），
+                // 不能作为同一性比较键；AXTitle/AXRole 在“同应用切文档/标签页”时会变化。
+                // 不取 AXValue：口述插入后正文必然变化，不能参与身份。
+                // 三部件全空时 target_key 为 None，比较退化为既有 PID-only 行为。
+                target_key: {
+                    let window_title = attribute(focus.0, "AXWindow")
+                        .and_then(|window| string(window.0, "AXTitle"))
+                        .filter(|title| !title.trim().is_empty());
+                    let element_hint = ["AXTitle", "AXDescription"]
+                        .iter()
+                        .find_map(|key| string(focus.0, key).filter(|value| !value.trim().is_empty()));
+                    let parts: Vec<String> = [
+                        Some(pid.to_string()),
+                        window_title,
+                        (!role.is_empty()).then(|| role.clone()),
+                        element_hint,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    (parts.len() > 1).then(|| parts.join("|"))
+                },
                 self_target: false,
             }
         }
@@ -278,19 +310,76 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn unknown_cursor_and_changed_app_never_paste() {
-        assert!(ensure_target(&unavailable("无光标"), None).is_err());
-        let target = InputTarget {
+
+    fn editable_target(target_key: Option<&str>) -> InputTarget {
+        InputTarget {
             editable: true,
             app_pid: Some(123),
             reason: String::new(),
-            target_key: None,
+            target_key: target_key.map(str::to_string),
             self_target: false,
-        };
+        }
+    }
+
+    #[test]
+    fn unknown_cursor_and_changed_app_never_paste() {
+        assert!(ensure_target(&unavailable("无光标"), None, None).is_err());
+        let target = editable_target(None);
         // 自身目标 editable 恒为 false：跨应用粘贴链路对自家永远拒绝
-        assert!(ensure_target(&self_target(), None).is_err());
-        assert!(ensure_target(&target, Some(123)).is_ok());
-        assert!(ensure_target(&target, Some(456)).is_err());
+        assert!(ensure_target(&self_target(), None, None).is_err());
+        assert!(ensure_target(&target, Some(123), None).is_ok());
+        assert!(ensure_target(&target, Some(456), None).is_err());
+    }
+
+    #[test]
+    fn same_stable_identity_allows_paste_within_same_app() {
+        assert!(ensure_target(
+            &editable_target(Some("123:Doc|AXTextField|备注")),
+            Some(123),
+            Some("123:Doc|AXTextField|备注")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn changed_window_title_or_focus_identity_rejects_paste() {
+        // 同应用内窗口标题变化（切文档/标签页）
+        assert!(ensure_target(
+            &editable_target(Some("123:Other|AXTextField|备注")),
+            Some(123),
+            Some("123:Doc|AXTextField|备注")
+        )
+        .is_err());
+        // 同应用内焦点元素身份变化（切输入框）
+        assert!(ensure_target(
+            &editable_target(Some("123:Doc|AXTextArea|备注")),
+            Some(123),
+            Some("123:Doc|AXTextField|备注")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lost_identity_at_paste_time_rejects_paste() {
+        // 录音时有身份、粘贴时探测退化：拒绝并降级复制卡
+        assert!(ensure_target(
+            &editable_target(None),
+            Some(123),
+            Some("123:Doc|AXTextField|备注")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn identity_free_targets_keep_pid_only_behavior() {
+        // 录音时无身份（AX 退化目标）：与现网一致，仅由 pid 决定
+        assert!(ensure_target(
+            &editable_target(Some("123:Doc|AXTextField|备注")),
+            Some(123),
+            None
+        )
+        .is_ok());
+        assert!(ensure_target(&editable_target(None), Some(123), None).is_ok());
+        assert!(ensure_target(&editable_target(None), Some(456), None).is_err());
     }
 }

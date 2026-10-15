@@ -218,7 +218,8 @@ pub async fn tools_apply_selection(
     if !current.is_some_and(|current| same_selection(&current, &expected)) {
         return Err("原选区已变化或失去焦点，请复制结果".into());
     }
-    paste_text(result, Some(expected.pid))
+    // 该路径已有更严格的选区文本精确匹配复核，不做输入位置身份比较
+    paste_text(result, Some(expected.pid), None)
 }
 
 #[tauri::command]
@@ -493,7 +494,8 @@ pub async fn tools_replace(app: AppHandle, id: String) -> Result<(), String> {
         }
         return Err("原选区已变化或失去焦点，请重新选中原文后重试，或复制结果".into());
     }
-    let result = paste_text(session.result, Some(expected.pid));
+    // 该路径已有更严格的选区文本精确匹配复核，不做输入位置身份比较
+    let result = paste_text(session.result, Some(expected.pid), None);
     if result.is_err() {
         if let Some(window) = app.get_webview_window("result") {
             let _ = window.show();
