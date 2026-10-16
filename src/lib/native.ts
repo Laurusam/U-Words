@@ -59,6 +59,10 @@ export const native = {
     invoke<void>("show_overlay", { expanded, width: size?.width ?? null, height: size?.height ?? null }),
   hideOverlay: () => invoke<void>("hide_overlay"),
   resizeOverlay: (width: number, height: number) => invoke<void>("resize_overlay", { width, height }),
+  /** 原生动效（路线 B）：浮窗阶段通知（idle/record/process/flash/text/preview/image） */
+  effectsSetStage: (stage: string) => invoke<void>("effects_set_stage", { stage }),
+  /** 原生退场动画 + hide；disabled 返回 Err，调用方走旧 webview 退场路径 */
+  effectsExitOverlay: () => invoke<void>("effects_exit_overlay"),
   /** F3 选区编辑自动写入：校验失败即 Err，由调用方落入 [复制] 兜底 */
   applySelection: (source: string, result: string, selection: SelectionSnapshot | null) =>
     invoke<void>("tools_apply_selection", { source, result, selection }),

@@ -91,6 +91,7 @@ const DEFAULT_CONFIG: AppConfig = {
   launchAtLogin: false,
   activeModel: "small-q5_1",
   historyRetention: "30",
+  nativeEffects: false,
 };
 
 const EMPTY_MODEL: ModelStatus = {
@@ -1227,13 +1228,14 @@ function MainApp() {
       message: statusMessage,
       text: renderedText || rawText,
       theme: config.theme,
+      nativeEffects: config.nativeEffects,
       preview: resultPreview,
       // base64 图片不进状态帧（见上方 overlay-image 通道），overlay 侧合并缓存后渲染
       result: overlayResult ? { ...overlayResult, image: undefined } : undefined,
     };
     latestOverlayRef.current = overlayState;
     void emitTo("overlay", OVERLAY_STATE_EVENT, overlayState).catch(() => undefined);
-  }, [config.mode, config.theme, isTauriRuntime, operation, overlayResult, rawText, renderedText, resultPreview, status, statusMessage]);
+  }, [config.mode, config.theme, config.nativeEffects, isTauriRuntime, operation, overlayResult, rawText, renderedText, resultPreview, status, statusMessage]);
 
   useEffect(() => {
     let active = true;
@@ -1943,6 +1945,8 @@ function OverlayApp() {
   const [image, setImage] = useState<string | null>(null);
   const copyTimer = useRef(0);
   const exitingRef = useRef(false);
+  // 原生退场的兜底定时器：完成事件 400ms 未到（宿主构建失败等）则回落 webview 退场
+  const nativeExitFallbackRef = useRef(0);
   // 记录本次退场发起时的 stage：录音/处理中的取消不向主窗补发 dismiss（避免误关新会话）
   const exitStageRef = useRef<ReturnType<typeof resolveStage>>(null);
   const previewOpen = Boolean(state.preview && state.text.trim());
@@ -1950,13 +1954,55 @@ function OverlayApp() {
   const stageKind = resolveStage(mergedState);
   const resultKey = state.result ? `${state.result.writeStatus ?? ""}|${state.result.text}` : "";
 
-  // 统一出口：先播 160ms 退场动画（CapsuleStage），完成回调里真正 hide 窗口
+  // 统一出口：webview 路径先播 160ms 退场动画（CapsuleStage），完成回调里真正 hide 窗口；
+  // 原生路径交由 Rust effects_exit_overlay（scale/opacity 在原生层），完成事件回发后收尾
   const exitAndHide = () => {
     if (exitingRef.current) return;
     exitingRef.current = true;
     exitStageRef.current = stageKind;
+    if (state.nativeEffects) {
+      nativeExitFallbackRef.current = window.setTimeout(() => {
+        // 原生退场未确认完成：回落 webview 退场路径
+        if (exitingRef.current) {
+          exitingRef.current = false;
+          setExiting(true);
+        }
+      }, 400);
+      void native.effectsExitOverlay().catch(() => {
+        window.clearTimeout(nativeExitFallbackRef.current);
+        exitingRef.current = false;
+        setExiting(true);
+      });
+      return;
+    }
     setExiting(true);
   };
+
+  // 原生退场完成：等价 handleExited 的收尾（窗口已由 Rust hide，跳过 hideOverlay）
+  useEffect(() => {
+    if (!state.nativeEffects) return;
+    let dispose: () => void = () => undefined;
+    void listen("u-words-overlay-exited", () => {
+      window.clearTimeout(nativeExitFallbackRef.current);
+      exitingRef.current = false;
+      setExiting(false);
+      // 自动关闭路径不经主窗 dismiss，这里补发清掉结果载荷；录音/处理中的取消不补发；
+      // 手动 dismiss/Esc 重复发送，主窗侧全是幂等清除
+      if (exitStageRef.current !== "record" && exitStageRef.current !== "process") {
+        void emitTo("main", OVERLAY_COMMAND_EVENT, "dismiss").catch(() => undefined);
+      }
+      exitStageRef.current = null;
+    }).then((off) => {
+      dispose = off;
+    }).catch(() => undefined);
+    return () => dispose();
+  }, [state.nativeEffects]);
+
+  // 原生动效：阶段变化同步给原生层（record 显示 bar、process 沉降、idle 清理、退场中断）
+  useEffect(() => {
+    if (!state.nativeEffects) return;
+    void native.effectsSetStage(stageKind ?? "idle").catch(() => undefined);
+  }, [stageKind, state.nativeEffects]);
 
   const handleExited = () => {
     exitingRef.current = false;

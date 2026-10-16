@@ -35,4 +35,8 @@ whisper-rs = "0.16.0"
 # AppKit identifies the frontmost app without asking for Automation access to
 # System Events. objc2 is used by AppKit's generated bindings.
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace", "NSRunningApplication", "libc"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace", "NSAccessibility", "NSRunningApplication", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSColor", "objc2-quartz-core", "libc"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGColor", "CGColorSpace", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo", "std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CALayer", "CATransaction", "CATransform3D", "CAMediaTiming", "CAMediaTimingFunction", "objc2-core-foundation", "objc2-core-graphics", "std"] }

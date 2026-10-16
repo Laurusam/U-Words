@@ -165,6 +165,10 @@ pub async fn recording_start(app: AppHandle, device_name: Option<String>) -> Res
                                 / samples.len().max(1) as f32)
                                 .sqrt();
                             let level = ((rms - 0.002).max(0.) * 12.).powf(0.65).min(1.);
+                            // 双写：原生动效层走进程内原子量（effects.rs），webview 仍走事件（主窗波形/状态桥）
+                            if let Some(state) = app.try_state::<crate::EffectsState>() {
+                                state.level_bits.store(level.to_bits(), Ordering::Relaxed);
+                            }
                             let _ = app.emit("native-audio-level", level);
                             meter = Instant::now();
                         }
@@ -207,6 +211,9 @@ pub async fn recording_start(app: AppHandle, device_name: Option<String>) -> Res
                 }
             }
             writer.finalize().map_err(|error| error.to_string())?;
+            if let Some(state) = app.try_state::<crate::EffectsState>() {
+                state.level_bits.store(0f32.to_bits(), Ordering::Relaxed);
+            }
             let _ = app.emit("native-audio-level", 0f32);
             if cancelled {
                 let _ = fs::remove_file(file);

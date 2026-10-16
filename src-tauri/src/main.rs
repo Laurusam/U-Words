@@ -5,6 +5,9 @@ mod capture;
 mod cloud_asr;
 mod config;
 mod context_tools;
+mod effects;
+mod effects_geom;
+mod effects_spring;
 mod input_target;
 mod llm;
 mod models;
@@ -27,7 +30,7 @@ use std::{
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 use whisper_rs::WhisperContext;
 
@@ -36,6 +39,24 @@ pub struct AppState {
     pub whisper_contexts: Arc<Mutex<HashMap<PathBuf, Arc<WhisperContext>>>>,
     pub whisper_execution_lock: Arc<Mutex<()>>,
     pub overlay_monitor: Mutex<Option<tauri::Monitor>>,
+}
+
+/// 原生动效跨线程状态（见 effects.rs）：enabled 由配置驱动（config.json nativeEffects），
+/// level_bits 由录音线程写、渲染 tick 读（f32 的位模式），theme 由 save_config/启动同步。
+#[derive(Default)]
+pub struct EffectsState {
+    pub enabled: std::sync::atomic::AtomicBool,
+    pub level_bits: std::sync::atomic::AtomicU32,
+    pub theme: std::sync::atomic::AtomicU8,
+}
+
+/// 启动时把配置落到 EffectsState（theme: 1=light 0=dark）
+pub fn sync_effects_state(app: &AppHandle, config: &config::AppConfig) {
+    use std::sync::atomic::Ordering;
+    if let Some(state) = app.try_state::<EffectsState>() {
+        state.enabled.store(config.native_effects, Ordering::Relaxed);
+        state.theme.store(if config.theme == "light" { 1 } else { 0 }, Ordering::Relaxed);
+    }
 }
 
 impl AppState {
@@ -62,9 +83,14 @@ fn main() {
         .manage(AppState::new().expect("初始化 U-Words 运行状态失败"))
         .manage(context_tools::ToolsState::default())
         .manage(recorder::RecorderState::default())
+        .manage(EffectsState::default())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             app.manage(storage::Store::open(app.handle()).map_err(std::io::Error::other)?);
+            effects::mount(app.handle());
+            if let Ok(config) = config::get_config(app.handle().clone()) {
+                sync_effects_state(app.handle(), &config);
+            }
             let show = MenuItemBuilder::with_id("show", "打开 U-Words").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "退出 U-Words").build(app)?;
             let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
@@ -145,7 +171,9 @@ fn main() {
             overlay::show_overlay,
             overlay::hide_overlay,
             overlay::resize_overlay,
-            overlay::hide_window
+            overlay::hide_window,
+            effects::effects_set_stage,
+            effects::effects_exit_overlay
         ])
         .on_window_event(|window, event| {
             if window.label() == "result" {

@@ -110,21 +110,42 @@ pub fn show_overlay(
     *anchor = Some(monitor.clone());
     drop(anchor);
     // 显式尺寸（F4 图片解析窗等自定义卡片）优先于两档预设形态
-    match (width, height) {
-        (Some(w), Some(h)) => position_overlay_sized(&window, &monitor, w, h, 24.0)?,
-        _ => position_overlay(&window, &monitor, expanded)?,
-    }
-    window
-        .show()
-        .map_err(|error| format!("显示悬浮窗失败：{error}"))
+    let (effective_w, effective_h) = match (width, height) {
+        (Some(w), Some(h)) => {
+            position_overlay_sized(&window, &monitor, w, h, 24.0)?;
+            (w, h)
+        }
+        _ => {
+            let expanded_flag = expanded;
+            position_overlay(&window, &monitor, expanded_flag)?;
+            if expanded_flag { (342.0, 222.0) } else { (166.0, 66.0) }
+        }
+    };
+    // 原生动效（路线 B）：同一闭包内保证“备层（opacity 0）→ show → 出场弹簧”的顺序，
+    // 关闭时 effects 入口直接返回，行为与现状完全一致
+    let effects_app = app.clone();
+    let effects_window = window.clone();
+    app.run_on_main_thread(move || {
+        eprintln!("[effects-dbg] show_overlay 闭包执行（native={}）", effects_app.try_state::<crate::EffectsState>().map(|s| s.enabled.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false));
+        crate::effects::prepare_show_now(&effects_app, effective_w, effective_h);
+        let _ = effects_window.show();
+        crate::effects::begin_enter_now(&effects_app);
+    })
+    .map_err(|error| format!("显示悬浮窗失败：{error}"))
 }
 
 #[tauri::command]
 pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
-    app.get_webview_window("overlay")
-        .ok_or_else(|| "悬浮窗不存在".to_string())?
-        .hide()
-        .map_err(|error| format!("隐藏悬浮窗失败：{error}"))
+    let window = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "悬浮窗不存在".to_string())?;
+    let effects_app = app.clone();
+    let effects_window = window.clone();
+    app.run_on_main_thread(move || {
+        crate::effects::handle_hidden_now(&effects_app);
+        let _ = effects_window.hide();
+    })
+    .map_err(|error| format!("隐藏悬浮窗失败：{error}"))
 }
 
 #[tauri::command]
@@ -159,5 +180,11 @@ pub fn resize_overlay(
             .ok_or_else(|| "未检测到可用显示器".to_string())?,
     };
     drop(anchor);
-    position_overlay_sized(&window, &monitor, width, height, 24.0)
+    position_overlay_sized(&window, &monitor, width, height, 24.0)?;
+    // 窗口尺寸已到位：原生壳 w/h/radius 弹簧跟随（关闭时直接返回）
+    let effects_app = app.clone();
+    app.run_on_main_thread(move || {
+        crate::effects::begin_morph_now(&effects_app, width, height);
+    })
+    .map_err(|error| format!("调整浮窗尺寸失败：{error}"))
 }

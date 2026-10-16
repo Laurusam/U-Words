@@ -53,12 +53,15 @@ function Glyph({ kind }: { kind: "close" | "check" | "warning" | "expand" }) {
   </svg>;
 }
 
-function RecordFace({ level, onCommand }: { level: number; onCommand: (command: OverlayCommand) => void }) {
+function RecordFace({ level, onCommand, nativeFx }: { level: number; onCommand: (command: OverlayCommand) => void; nativeFx?: boolean }) {
   const safe = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
   return <>
     <button type="button" className="floating-action floating-cancel" onClick={() => onCommand("cancel")} aria-label="取消录音" title="取消（Esc）"><Glyph kind="close" /></button>
-    {/* 电平经 overlay webview 本地 levelBus 以 ~60Hz rAF 直写 transform；state.level 只供首帧初值与静音变暗 */}
-    <Waveform barCount={13} className={"floating-meter" + (safe > .02 ? " live" : "")} initialLevel={safe} label="实时音量" />
+    {/* 非 native：电平经 overlay webview 本地 levelBus 以 ~60Hz rAF 直写 transform；
+        native：bar 由原生层绘制，webview 只保留等宽空槽（保 grid 布局） */}
+    {nativeFx
+      ? <div className="floating-meter" aria-label="实时音量" />
+      : <Waveform barCount={13} className={"floating-meter" + (safe > .02 ? " live" : "")} initialLevel={safe} label="实时音量" />}
     <button type="button" className="floating-action floating-confirm" onClick={() => onCommand("finish")} aria-label="完成录音" title="完成"><Glyph kind="check" /></button>
   </>;
 }
@@ -189,6 +192,8 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
   // 形变期鼠标穿透的恢复闭包：cancelAnims/卸载统一兜底，避免动画中断后窗口永久穿透
   const restoreCursorRef = useRef<(() => void) | null>(null);
   const [leaving, setLeaving] = useState<{ stage: StageKind; card: boolean } | null>(null);
+  // 原生动效模式：壳/bar/出场/形变/退场由 Rust 侧 Core Animation 驱动，webview 只画内容与按钮
+  const nativeFx = Boolean(state.nativeEffects);
 
   // 新结果/内容变化或离开结果窗时收起对照（writeStatus+text 作键，避开跨窗事件的对象身份抖动）
   const resultKey = state.result ? `${state.result.writeStatus ?? ""}|${state.result.text}` : "";
@@ -245,6 +250,13 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
       geomKeyRef.current = geomKey;
       geomRef.current = { ...target.shell };
       applyGeom();
+      if (nativeFx) {
+        // 原生模式：壳 div 直接全尺寸全亮（出场视觉由原生层对 webview 层整体变换），
+        // 这里必须写恒等变换——capsule.css 初始 opacity:0（防白底）否则内容永久不可见
+        xfRef.current = { scale: 1, y: 0, opacity: 1 };
+        applyXf();
+        return;
+      }
       xfRef.current = { scale: .6, y: 14, opacity: 0 };
       applyXf();
       const xf = xfRef.current;
@@ -257,7 +269,7 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
     }
 
     // 中断未完成的退场/前序动画：清掉残留弹簧（退场/形变同一属性只保留一个动画源），
-    // 恢复常态变换再走 crossfade/形变
+    // 恢复常态变换再走 crossfade/形变（native 模式同样要写恒等变换到壳 div）
     cancelAnims();
     xfRef.current = { scale: 1, y: 0, opacity: 1 };
     applyXf();
@@ -270,12 +282,21 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
     if (geomKeyRef.current !== geomKey) {
       geomKeyRef.current = geomKey;
       const windowSize = target.window;
+      if (hasTauriRuntime()) {
+        void native.resizeOverlay(windowSize.width, windowSize.height).catch(() => undefined);
+      }
+      if (nativeFx) {
+        // 原生模式：webview 壳 div 立即落位目标几何（内容按最终尺寸布局），
+        // 视觉形变由原生壳弹簧承担；穿透由 Rust 侧管理（begin_morph）
+        geomRef.current = { ...target.shell };
+        applyGeom();
+        return;
+      }
       const reduced = prefersReducedMotion();
       let restoreCursor: (() => void) | null = null;
       if (hasTauriRuntime()) {
         const currentWindow = getCurrentWindow();
         void currentWindow.setIgnoreCursorEvents(true).catch(() => undefined);
-        void native.resizeOverlay(windowSize.width, windowSize.height).catch(() => undefined);
         restoreCursor = () => {
           if (!restoreCursorRef.current) return; // 幂等：完成与中断只恢复一次
           restoreCursorRef.current = null;
@@ -300,13 +321,24 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
         animateSpring({ from: geomRef.current.radius, to: target.shell.radius, config: SPRING_POP, onUpdate: v => { geomRef.current.radius = v; applyGeom(); }, onComplete: complete }),
       );
     }
-  }, [stage, geomKey]);
+  }, [stage, geomKey, nativeFx]);
 
   // 退场：160ms 收缩淡出后交还上层（hide 窗口）
   useEffect(() => {
     if (!exiting) return;
     const shell = shellRef.current;
     if (!shell) {
+      onExitedRef.current();
+      return;
+    }
+    if (nativeFx) {
+      // 原生退场由 Rust effects_exit_overlay 驱动（整体 scale/opacity 在原生层）；
+      // webview 直接复位壳状态交还上层，hide 由 Rust 完成
+      enteredRef.current = false;
+      stageRef.current = null;
+      geomKeyRef.current = null;
+      shell.classList.add("capsule-shell--idle");
+      setLeaving(null);
       onExitedRef.current();
       return;
     }
@@ -336,7 +368,7 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
     return () => {
       for (const anim of created) anim.cancel();
     };
-  }, [exiting]);
+  }, [exiting, nativeFx]);
 
   // 卸载清理
   useEffect(() => () => {
@@ -347,7 +379,7 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
   const level = Number.isFinite(state.level) ? Math.max(0, Math.min(1, state.level)) : 0;
   const renderFace = (kind: StageKind, isLeaving: boolean) => {
     switch (kind) {
-      case "record": return <RecordFace level={isLeaving ? 0 : level} onCommand={onCommand} />;
+      case "record": return <RecordFace level={isLeaving ? 0 : level} onCommand={onCommand} nativeFx={nativeFx} />;
       case "process": return <ProcessFace transcribing={state.status === "transcribing"} onCommand={onCommand} />;
       case "flash": return <FlashFace ready={state.status === "ready"} onCommand={onCommand} />;
       case "text": return state.result
@@ -372,7 +404,7 @@ export function CapsuleStage({ state, countdown, copyFeedback, exiting, onComman
     {card ? null : <div className="floating-mode-label" aria-hidden={!state.label}>{state.label || ""}</div>}
     <section
       ref={shellRef}
-      className={`capsule-shell${stage === null ? " capsule-shell--idle" : ""}`}
+      className={`capsule-shell${stage === null ? " capsule-shell--idle" : ""}${nativeFx && stage !== null ? " capsule-shell--native" : ""}`}
       role={stage === "flash" && state.status === "error" ? "alert" : "status"}
       aria-label={statusLabel || undefined}
     >

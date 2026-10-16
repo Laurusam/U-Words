@@ -45,6 +45,9 @@ pub struct AppConfig {
     pub launch_at_login: bool,
     pub active_model: String,
     pub history_retention: String,
+    /// 原生动效层（路线 B）：true 时浮窗壳/波形/形态动画走 Core Animation。
+    /// 默认 false 走既有 webview 路径；编辑 config.json 重启生效。
+    pub native_effects: bool,
 }
 
 impl Default for AppConfig {
@@ -78,6 +81,7 @@ impl Default for AppConfig {
             launch_at_login: false,
             active_model: crate::models::DEFAULT_MODEL_ID.into(),
             history_retention: "30".into(),
+            native_effects: false,
         }
     }
 }
@@ -135,7 +139,14 @@ pub fn get_config(app: AppHandle) -> Result<AppConfig, String> {
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    write_config(&app, &config)
+    write_config(&app, &config)?;
+    // 主题与原生动效开关同步到原生层（ EffectsState 为跨线程原子量，见 main.rs）
+    if let Some(state) = app.try_state::<crate::EffectsState>() {
+        use std::sync::atomic::Ordering;
+        state.enabled.store(config.native_effects, Ordering::Relaxed);
+        state.theme.store(if config.theme == "light" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 #[tauri::command]

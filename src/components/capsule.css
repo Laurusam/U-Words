@@ -20,6 +20,10 @@
 
 .capsule-shell--idle { display: none; }
 
+/* 原生动效模式（nativeEffects）：壳底/边框/圆角由原生 CALayer 绘制，
+   webview 壳只保留几何（内容裁剪与布局）与内容本身；transform 交原生层 */
+.capsule-shell--native { background: transparent; border-color: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+
 /* 同一壳形态内的 stage 切换：旧 face 层淡出、新 face 层淡入（200ms） */
 .capsule-face-layer { position: absolute; inset: 0; }
 

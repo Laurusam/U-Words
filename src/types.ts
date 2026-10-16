@@ -54,6 +54,8 @@ export type OverlayState = {
   preview?: boolean;
   result?: OverlayResult;
   copyFeedback?: string;
+  /** 原生动效开启：壳/bar/形变由原生层渲染，webview 只画内容卡与按钮 */
+  nativeEffects?: boolean;
   /** 复制预览窗自动关闭剩余秒数；仅 overlay 窗口内部计算，主窗不下发 */
   countdown?: number;
 };
@@ -101,6 +103,8 @@ export type AppConfig = {
   launchAtLogin: boolean;
   activeModel: string;
   historyRetention: HistoryRetention;
+  /** 原生动效层（路线 B）：true 时浮窗壳/波形/形态动画走 Core Animation（config.json nativeEffects） */
+  nativeEffects: boolean;
 };
 
 export type ModelStatus = {

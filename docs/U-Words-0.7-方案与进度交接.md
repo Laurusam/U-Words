@@ -459,3 +459,23 @@ P0 增量：
 **测试与验证**：tsc 0 错；npm test 65/65（新增：waveform 13-bar 初值 SSR、overlay A/B 契约、test-scenes.mjs 3 例——Rust/TS 场景目录一致性、normalizeScenes、全链路接线 + 死配置移除契约）；cargo check 0 错 0 警；cargo test 40 过（新增 scenes 2、llm scene_hint 1、asr context_prompt 1、input_target 身份 4 并更新 1）+ 6 失败为既有沙箱 TcpListener 基线（与改动前清单完全一致）；vite build 通过；dev 预览浮窗五态 + 13 bar 渲染确认。
 
 **真机待验证**：A2 竞态（工具语音结束瞬间 Esc → 立即再录，无 error 浮窗）；B 浮窗波形灵敏度 ≈ 主窗、静音自动暂停；C 场景改选后云端请求含场景段且不含应用名、口述技术内容术语保持；D 同应用切文档/标签拒插（降级复制卡）、同输入框放行、连续口述 continuity 开始命中。原生动效路线 B（NSPanel+CALayer / Windows Composition）轮廓见计划文档，启动条件：本轮 B 实测仍不达标才立项，分支 `feat/native-effects`。
+
+### 12.12 原生动效路线 B 第一轮（feat/native-effects，2026-10-15）
+
+用户裁定跳过真机等待直接开路线 B。**Phase 0**：审计收尾轮先以 `65ce8fb` 提交 `codex/uwords-context-tools`（本地，未推送），再切 `feat/native-effects`。本轮实现 Phase 1+2 全部（不提交，按用户指示）。
+
+**架构落地**（设计评审时的重要发现）：
+- **前端 setIgnoreCursorEvents 是历史死代码**：capabilities 只有 core:default，`core:window:allow-set-ignore-cursor-events` 缺失，JS 调用被 ACL 拒绝且被 `.catch` 吞掉——形变期穿透从未生效过。本轮已补权限（旧路径穿透首次真实生效，属可见行为变化），且路线 B 把穿透迁到 Rust 侧（不经 ACL）
+- objc2-app-kit feature 组合实测确认：NSAccessibility（accessibilityDisplayShouldReduceMotion 所在的类目文件被它门控，不是 NSWorkspace/NSAccessibilityConstants）、NSResponder（NSView 结构体本体依赖）、objc2-quartz-core 的 objc2-core-foundation/objc2-core-graphics（CATransform3D 自由函数与 CALayer 颜色方法的门控）；Retained 在 `objc2::rc` 路径；CATransform3D 用关联函数 new_scale/new_translation/concat（旧自由函数已 deprecated）
+- reduced-motion：`NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()`（实例方法，非 Enabled 变体）
+
+**新增模块**：`effects_geom.rs`（几何表 + bar 布局/scaleY 纯函数，9 测含与 test-waveform.mjs 同源参考值）、`effects_spring.rs`（spring.ts 逐字平移：SPRING_POP 260/22、SPRING_SETTLE 320/32、半隐式欧拉、dt 钳 32ms、cancel=移除不回调；6 测）、`effects.rs`（macOS 编排层，非 macOS 空实现 + Err 哨兵）。
+
+**effects.rs 要点**：宿主为 layer-hosting NSView，挂在 wry WryWebViewParent 下、显式 `addSubview_positioned_relativeTo(Below, webview)`（webview drawsBackground=false 已核实，原生层透出）；CVDisplayLink 只做起搏器（回调线程仅合并唤醒标志，`run_on_main_thread` 投递主线程 tick；活动才 start/stop，空闲零唤醒）；Engine+Host 同驻 thread_local（AppKit MainThreadOnly 不能进 managed）；电平走 `EffectsState{enabled,level_bits,theme}` 原子量（recorder 两点双写，emit 保留给主窗）；enter/morph/exit 弹簧 + bar 一阶低通（tau=45ms 对齐 webview transition）+ process 逐根沉降（stagger 12ms、200ms css_ease）+ 静音 13 帧停摆；穿透由 begin_morph `set_ignore_cursor_events(true)`、完成/取消/隐藏路径幂等恢复；`UWORDS_EFFECTS_TIMING=1` 打帧耗日志（p99）。
+
+**命令与前端**：新命令 effects_set_stage（OverlayApp 在 resolveStage 变化时同步 idle/record/process/flash/text/preview/image）+ effects_exit_overlay（退场 2 弹簧→完成回调 hide 窗口 + emit `u-words-overlay-exited`）；show_overlay/hide_overlay/resize_overlay 以 run_on_main 组合闭包保证"备层（opacity 0）→ show → 出场弹簧"与"窗口先到位→壳弹簧"时序；config 增 `nativeEffects: bool`（默认 false，编辑 config.json 重启生效，save_config/启动同步 EffectsState）；CapsuleStage nativeFx 分支：壳 div 透明化（`capsule-shell--native`）、几何立即落位（内容按最终尺寸布局）、弹簧/穿透调用退役、RecordFace 波形换等宽空槽（60Hz rAF 退出 webview）；OverlayApp 原生退场走 effectsExitOverlay + 400ms 兜底回落 webview 路径。
+**关键修复**：capsule.css 壳初始 opacity:0（防白底）在 native 分支会导致内容永久不可见——native 进场必须写恒等变换到壳 div（测试契约随之更新）。
+
+**验证**：tsc 0 错、npm test 66/66（新增 native-effects 契约 1 例）、cargo check 0 错 0 警、cargo test 49 过（新增 effects 9 例）+ 6 失败为既有沙箱 TcpListener 基线、vite build 通过、dev 预览无报错（webview 路径零回归：13 bar/19 按钮全渲染）。**未提交**（按用户指示）。
+
+**真机门禁（用户验收，全过才保留路线）**：① 单帧 tick+写层 <2ms（`UWORDS_EFFECTS_TIMING=1` 看 p99）② 录音 5 分钟 CPU ≤2% 且不高于 webview 基线；空闲 display link 零唤醒 ③ ProMotion 120Hz 出场 ~380ms 无撕裂 ④ 混合 DPI 拖动无错像素。**A/B**：config.json `nativeEffects` true/false 重启切换对比。**已知 spike 项**：WEBVIEW_XFORM_SYNC（webview 层跟随壳变换）若与 WebKit 合成冲突，置 false 退化；mask 方案未实现（morph 期内容按最终尺寸布局，靠 webview 层变换掩盖，若穿帮再做 mask/延迟淡入）。Phase 3 可选（真磨砂/14+ CADisplayLink/face 按钮原生化/Windows Composition）另评。

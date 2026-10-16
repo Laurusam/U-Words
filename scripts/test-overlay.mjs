@@ -250,3 +250,27 @@ test("A/B robustness contracts: usage SQLite-first, session generation guard, ov
   assert.match(capsule, /<Waveform barCount=\{13\}/);
   assert.doesNotMatch(capsule, /Array\.from\(\{ length: 13 \}/);
 });
+
+test("native-effects contracts: capsule defers shell/bar/exit to the Rust layer", async () => {
+  const capsule = await readFile(new URL("../src/components/CapsuleStage.tsx", import.meta.url), "utf8");
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const nativeLib = await readFile(new URL("../src/lib/native.ts", import.meta.url), "utf8");
+  // CapsuleStage：native 分支壳透明化 class + 三处弹簧/穿透退役守卫 + RecordFace 条件波形
+  assert.match(capsule, /const nativeFx = Boolean\(state\.nativeEffects\);/);
+  assert.match(capsule, /capsule-shell--native/);
+  assert.match(capsule, /原生模式：壳 div 直接全尺寸全亮/);
+  assert.match(capsule, /\/\/ 原生模式：webview 壳 div 立即落位目标几何/);
+  assert.match(capsule, /\/\/ 原生退场由 Rust effects_exit_overlay 驱动/);
+  assert.match(capsule, /nativeFx\n\s+\? <div className="floating-meter"/);
+  // 原生分支不再调用穿透 API（Rust 侧管理）；webview 分支保留
+  assert.match(capsule, /setIgnoreCursorEvents\(true\)/);
+  // App.tsx：阶段同步 + 原生退场 + 完成事件收尾 + 状态帧携带开关
+  assert.match(app, /effectsSetStage\(stageKind \?\? "idle"\)/);
+  assert.match(app, /native\.effectsExitOverlay\(\)/);
+  assert.match(app, /listen\("u-words-overlay-exited"/);
+  assert.match(app, /nativeEffects: config\.nativeEffects/);
+  assert.match(app, /nativeEffects: false,/);
+  // native.ts：两个命令包装
+  assert.match(nativeLib, /effectsSetStage: \(stage: string\) => invoke<void>\("effects_set_stage"/);
+  assert.match(nativeLib, /effectsExitOverlay: \(\) => invoke<void>\("effects_exit_overlay"\)/);
+});
