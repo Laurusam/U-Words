@@ -22,7 +22,7 @@ U-Words 是一个面向个人工作流的桌面语音输入与文字处理项目
 
 > **当前版本：0.8.0 · 持续开发中**
 >
-> 最新实现位于 [`codex/uwords-context-tools`](https://github.com/Laurusam/U-Words/tree/codex/uwords-context-tools)，尚未合并至 `main`
+> 最新实现已合入 `main`；`codex/uwords-context-tools` 为历史开发分支
 
 > 已有 macOS 本地构建与安装记录，仓库配置了 macOS arm64 / Windows x64 构建流程；这不代表双平台功能已全部完成实机验收
 
